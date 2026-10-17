@@ -1,4 +1,4 @@
-# CyclePatrol
+# CyclePatrol (re-invented wifi WarDriving)
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![platform](https://img.shields.io/badge/platform-Linux%20%7C%20Android%20(Kali%20NetHunter)-informational)
