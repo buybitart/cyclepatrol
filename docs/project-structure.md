@@ -3,31 +3,41 @@
 ## Repository tree
 
 ```text
-wps_scan/
-├── cp.sh              # the whole tool (bash, 7130 lines, 159 functions)
+cyclepatrol/
+├── cp.sh              # the whole tool (bash, ~8400 lines, ~213 functions)
 ├── vendor/
 │   ├── oui.json       # OUI prefix -> vendor id map (large)
 │   └── vendors.json   # vendor knowledge base: name, behaviours, recommendations
+├── docs/              # this documentation set
 ├── README.md
 └── LICENSE            # MIT, (c) 2026 Aliaksandr Zasinets
 ```
 
-There is no `docs/` in the original repo (this documentation adds it), no test suite, no CI config,
-and no separate config file. Config is env vars + CLI flags only.
+Config is env vars + CLI flags only. There is no separate config file. The tool keeps its state in
+Bash variables and flat files under `LOG_DIR` at runtime, not in the repo.
+
+### Tests
+
+The repo root does not ship a tracked test suite or CI config. Development uses a set of Bash test
+harnesses (`test_*.sh`) that source `cp.sh` and check individual functions and the report output.
+They live alongside the working copy, not under version control yet. See
+[`setup-and-testing.md`](setup-and-testing.md) for how to run them and the no-root syntax and
+lint checks.
 
 ## Vendor data files
 
 | File | Format | Used by | Content |
 |---|---|---|---|
-| `vendor/oui.json` | JSON object `{ "oo:uu:ii": "vID" }` | `vendor_kb_lookup_oui` | map a MAC OUI to a vendor id |
-| `vendor/vendors.json` | JSON object keyed by vendor id | `vendor_kb_vendor_name` / `_array` | `name`, `behaviours`, `recommendations` per vendor |
+| `vendor/oui.json` | JSON object, 40,549 entries `{ "oo:uu:ii": "vID" }` | `vendor_kb_lookup_oui` | map a MAC OUI to a vendor id |
+| `vendor/vendors.json` | JSON object, 20,320 records keyed by vendor id | `vendor_kb_vendor_name` / `_array` | `name`, and optional `behaviours` and `recommendations` per vendor |
 
 Lookups prefer `jq` if present, else fall back to `grep`/`awk`/`sed`.
 Controlled by `ENABLE_VENDOR_KB` (default 1) and `VENDOR_DIR` (default `./vendor`).
+These files are third-party data. See [`security.md`](security.md) for the licensing note.
 
 ## Function map (by area)
 
-159 functions. Grouped by job, with a few line anchors.
+Grouped by job, with a few examples per area.
 
 ### Startup / config / validation
 `main`, `validate_env`, `validate_positive_int`, `run_precheck`,
@@ -35,7 +45,7 @@ Controlled by `ENABLE_VENDOR_KB` (default 1) and `VENDOR_DIR` (default `./vendor
 
 ### Logging / audit / cleanup
 `ts_now`, `audit_write` / `audit_blank` / `audit_header`, `print_log`,
-`log_target_detail`, `log_attempt`, `run_cleanup`.
+`log_target_detail`, `log_attempt`, `log_event`, `run_cleanup`.
 
 ### Interface / mode / stealth
 `iface_get_type`, `iface_set_type`, `ensure_mode`, `iface_set_channel`,
@@ -86,9 +96,11 @@ Support: `_reaver_init_help_cache`, `_reaver_has_opt`,
 `wpa_audit_allowed`, `wpa_audit_posture`, `wpa_audit_external_dispatch`.
 
 ### Evidence / records
-`report_state_*`, `sar_json_get`, `sar_store_record`,
-`sar_store_locked_stub`, `save_registrar`, `verify_psk_live`,
-`save_proof`, `_write_finding_proof`, `_iso_write_proof`.
+`report_state_*`, `sar_store_record`, `save_registrar`, `verify_psk_live`,
+`save_proof`, `_proofs_manifest_add`.
+
+### Posture findings
+`build_posture_findings`, `_essid_default_scheme`, `build_corpus_findings`.
 
 ### Location / war-driving
 `location_is_enabled`, `location_ingest_scan_targets`, `location_env`,
@@ -97,9 +109,11 @@ Support: `_reaver_init_help_cache`, `_reaver_has_opt`,
 
 ### Reporting
 `make_report` with helpers `_sar_field`, `_band_from_ch`, `_html_escape`,
-`_attempts_for`, `_evtype_for`, `_finding_meta`, `_proof_for`,
+`_finding_meta`, `_proof_for`, `_proof_live_verified`,
 `_show_pin` / `_show_psk` / `_mask_psk`, `_sev_color` / `_sev_bg` / `_sev_label`,
-`_state_badge`, `_prio_badge`, `_fcard`.
+`_state_badge`, `_prio_badge`, `_fcard`,
+`_report_view_toggle`, `_report_signal_chart` / `_report_signal_hist`,
+`_report_channel_chart`, `_report_diag_logs`.
 Recon: `run_recon`, `recon_report`, `_recon_uptime_fmt`, `_recon_embed_png`.
 
 ### Baseline
@@ -107,19 +121,15 @@ Recon: `run_recon`, `recon_report`, `_recon_uptime_fmt`, `_recon_embed_png`.
 
 ### Defined but not called (dead code)
 
-Verified by usage audit — these functions have no caller and are not dispatched dynamically:
-`sae_dos_dragondrain`, `sae_timing_dragontime`, `sar_store_locked_stub`,
-`sar_json_get`, `rule_result_pack`, `rule_result_emit_wire`,
-`_write_finding_proof`, `_iso_write_proof`, `_attempts_for`,
-`_wps_tried_rejected`, `get_vendor_lock_type`.
-They are listed in the groups above by purpose, but do not run in this build. See
-[`security.md`](security.md) O6. Note: `_ar_engine_dw` is a dynamic hook that only ever
-calls `ar_dual_write_after_scanner`, which is not defined — so it is a no-op.
+Verified by usage audit, these functions have no caller and are not dispatched dynamically:
+`sae_dos_dragondrain`, `sae_timing_dragontime`. They are listed under
+assessment modules by purpose, but do not run in this build. See
+[`security.md`](security.md) and [`modules.md`](modules.md#sae-dos--timing--present-but-not-called-dead-code).
 
 ## Globals and state
 
 - Band channel lists: `BAND_24`, `BAND_5`, `BAND_6E_PSC`.
-- Arrays: `FOUND_TARGETS`, `SAR_RECORDS`, `RULE_RESULTS`, `LOCATION_OBSERVATIONS`, `CREDS_FOUND`,
+- Arrays: `FOUND_TARGETS`, `SAR_RECORDS`, `LOCATION_OBSERVATIONS`, `CREDS_FOUND`,
   `ATTEMPT_LOG`, `BG_PIDS`.
 - Maps: `SESSION_PROCESSED`, `FOUND_SEEN`, `ACTIVE_ALLOWLIST`, `EVILTWIN_ALLOWLIST`,
   `IN_SCOPE_BSSIDS`, `OUI_CACHE`.

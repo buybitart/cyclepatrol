@@ -61,10 +61,10 @@ Support: `pin_check` / `wps_checksum` (WPS PIN checksum), `extract_wps_hex` / `v
 `dragontime`) are **defined but never called** anywhere in `cp.sh` (verified: the only lines that
 name them are their own definitions). So in this build:
 
-- these two WPA3/SAE checks never run;
+- these two WPA3/SAE checks never run.
 - `ENABLE_SAE_DOS`, `ENABLE_SAE_TIMING`, `SAE_DOS_SECS`, `SAE_TIMING_SECS`, `DRAGON_DOS_TOOL`,
-  `DRAGON_TIME_TOOL` have **no runtime effect** (they are only read inside those uncalled functions);
-- `ENABLE_SAE_PROBE` is read only by `validate_env` and `--help`; there is **no SAE-probe function**.
+  `DRAGON_TIME_TOOL` have **no runtime effect** (they are only read inside those uncalled functions).
+- `ENABLE_SAE_PROBE` is read only by `validate_env` and `--help`. There is **no SAE-probe function**.
 
 The `active_attack_permitted` calls inside these functions therefore never execute.
 

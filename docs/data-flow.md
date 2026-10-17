@@ -121,7 +121,7 @@ flowchart TD
 
 Note: `process_target` adds every scanned BSSID to `IN_SCOPE_BSSIDS` **before** the modules run.
 So the first check is already true for any AP the scanner saw. See [`security.md`](security.md)
-for the default-posture impact. Only active modules call the gate; the WPS PIN chain and the
+for the default-posture impact. Only active modules call the gate. The WPS PIN chain and the
 passive PMKID/EAPOL capture do not (see [`modules.md`](modules.md)).
 
 ## 5. Evidence and report
